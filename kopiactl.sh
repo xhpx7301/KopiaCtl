@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.9"
+readonly MANAGER_VERSION="1.0.10"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -21,6 +21,7 @@ readonly DEFAULT_WEB_UI_PORT="51515"
 
 # Only retained for the lifetime of the interactive menu process.
 REPOSITORY_PASSWORD=''
+MANAGER_UPDATED=false
 
 if [[ -t 1 ]]; then
   readonly RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m' BLUE=$'\033[34m' BOLD=$'\033[1m' RESET=$'\033[0m'
@@ -170,7 +171,9 @@ update_manager() {
   [[ ! -f "$MANAGER_SCRIPT" ]] || cp -a "$MANAGER_SCRIPT" "${BACKUP_DIR}/kopiactl-before-update.$(timestamp).bak"
   install -m 0755 "$temp_file" "$MANAGER_SCRIPT"
   rm -f "$temp_file"
+  MANAGER_UPDATED=true
   success "KopiaCtl 已更新：${MANAGER_VERSION} -> ${new_version:-未知版本}。"
+  info '按回车键后将自动重新载入新版菜单。'
 }
 
 install_native_kopia() {
@@ -781,7 +784,11 @@ main_menu() {
       8) show_repository_status; pause_menu ;;
       9) show_logs; pause_menu ;;
       10) backup_local_config; pause_menu ;;
-      11) update_manager; pause_menu ;;
+      11)
+        update_manager
+        pause_menu
+        [[ "$MANAGER_UPDATED" != true ]] || exec "$MANAGER_SCRIPT"
+        ;;
       12) uninstall_menu; pause_menu ;;
       0) exit 0 ;;
       *) warn '无效选项。'; pause_menu ;;
