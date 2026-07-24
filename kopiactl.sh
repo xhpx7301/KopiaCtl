@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.3"
+readonly MANAGER_VERSION="1.0.4"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -423,11 +423,13 @@ EOF
 valid_web_ui_value() { [[ "$1" =~ ^[A-Za-z0-9@%+=_,.!:-]+$ ]]; }
 
 configure_web_ui_credentials() {
-  local user password confirm port
-  read -r -p 'Web UI 用户名 [admin]：' user
-  user="${user:-admin}"
-  read -r -p "监听端口 [${DEFAULT_WEB_UI_PORT}]：" port
-  port="${port:-$DEFAULT_WEB_UI_PORT}"
+  local enabled="${1:-true}" user password confirm port default_user default_port
+  default_user="$(web_ui_user)"
+  default_port="$(web_ui_port)"
+  read -r -p "Web UI 用户名 [${default_user}]：" user
+  user="${user:-$default_user}"
+  read -r -p "监听端口 [${default_port}]：" port
+  port="${port:-$default_port}"
   [[ "$port" =~ ^[1-9][0-9]{0,4}$ && "$port" -le 65535 ]] || { error '端口必须在 1-65535 之间。'; return 1; }
   read -r -s -p '设置 Web UI 密码（至少 12 位，仅允许字母、数字和 @%+=_,.!:-）：' password; printf '\n'
   read -r -s -p '再次输入密码：' confirm; printf '\n'
@@ -436,14 +438,21 @@ configure_web_ui_credentials() {
     return 1
   fi
   valid_web_ui_value "$user" || { error '用户名包含不支持的字符。'; return 1; }
-  write_config "$(current_mode)" true "$user" "$password" "$port"
+  write_config "$(current_mode)" "$enabled" "$user" "$password" "$port"
 }
 
 start_web_ui() {
+  local existing_password
   ensure_config
   if ! web_ui_enabled; then
-    info 'Web UI 当前未配置，先设置登录凭据。'
-    configure_web_ui_credentials || return 1
+    existing_password="$(config_value WEB_UI_PASSWORD)"
+    if [[ -n "$existing_password" ]]; then
+      info '将使用已保存的登录凭据启用 Web UI。'
+      write_config "$(current_mode)" true "$(web_ui_user)" "$existing_password" "$(web_ui_port)"
+    else
+      info 'Web UI 当前未配置，先设置登录凭据。'
+      configure_web_ui_credentials true || return 1
+    fi
   fi
   case "$(current_mode)" in
     native)
@@ -480,15 +489,59 @@ web_ui_menu() {
   printf '  1. 启用并启动 Web UI\n'
   printf '  2. 停止并禁用 Web UI\n'
   printf '  3. 查看 Web UI 状态\n'
+  printf '  4. 查看 Web UI 登录凭据\n'
+  printf '  5. 修改 Web UI 登录凭据\n'
   printf '  0. 返回\n'
-  read -r -p '请选择 [0-3]：' selected
+  read -r -p '请选择 [0-5]：' selected
   case "$selected" in
     1) start_web_ui ;;
     2) stop_web_ui ;;
     3) show_web_ui_status ;;
+    4) show_web_ui_credentials ;;
+    5) modify_web_ui_credentials ;;
     0) return 0 ;;
     *) error '无效选项。'; return 1 ;;
   esac
+}
+
+show_web_ui_credentials() {
+  local password
+  ensure_config
+  password="$(config_value WEB_UI_PASSWORD)"
+  [[ -n "$password" ]] || { warn '尚未设置 Web UI 登录凭据。请先选择“启用并启动 Web UI”。'; return 0; }
+  printf '\n%sWeb UI 登录凭据%s\n' "$BOLD" "$RESET"
+  printf '登录地址：http://服务器IP:%s\n用户名：%s\n密码：已设置（默认不显示）\n' "$(web_ui_port)" "$(web_ui_user)"
+  confirm_action '确认在当前终端显示明文密码？' || return 0
+  printf '用户名：%s\n密码：%s\n' "$(web_ui_user)" "$password"
+}
+
+modify_web_ui_credentials() {
+  local was_enabled
+  ensure_config
+  was_enabled=false
+  web_ui_enabled && was_enabled=true
+  configure_web_ui_credentials "$was_enabled" || return 1
+  if [[ "$was_enabled" == true ]]; then
+    info '正在应用新的 Web UI 登录凭据...'
+    case "$(current_mode)" in
+      native)
+        write_native_service || return 1
+        if systemctl is-active --quiet kopia-web-ui.service; then
+          systemctl restart kopia-web-ui.service || { error 'Web UI 重启失败。'; return 1; }
+        else
+          systemctl enable --now kopia-web-ui.service || { error 'Web UI 启动失败。'; return 1; }
+        fi
+        ;;
+      docker)
+        require_docker || return 1
+        [[ -f "$COMPOSE_FILE" ]] || write_compose_file
+        (cd "$INSTALL_DIR" && docker compose --profile web up -d --force-recreate) || { error 'Web UI 容器重建失败。'; return 1; }
+        ;;
+    esac
+    success 'Web UI 登录凭据已修改并生效。'
+  else
+    success 'Web UI 登录凭据已保存；Web UI 仍保持未启用。'
+  fi
 }
 
 show_web_ui_status() {
