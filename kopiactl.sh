@@ -113,6 +113,13 @@ localize_service_state() {
     active) printf '运行中' ;;
     inactive) printf '已停止' ;;
     failed) printf '启动失败' ;;
+    created) printf '已创建，等待启动' ;;
+    restarting) printf '正在反复重启（异常）' ;;
+    running) printf '运行中' ;;
+    paused) printf '已暂停' ;;
+    exited) printf '已退出（异常）' ;;
+    dead) printf '无法运行（异常）' ;;
+    removing) printf '正在删除' ;;
     '') printf '未创建' ;;
     *) printf '%s' "$1" ;;
   esac
@@ -653,15 +660,61 @@ modify_web_ui_credentials() {
 }
 
 show_web_ui_status() {
-  local state
+  local state restarting restart_count exit_code oom_killed finished_at state_error
+  local container_address host_bindings browser_port
   case "$(current_mode)" in
     native)
       state="$(systemctl is-active kopia-web-ui.service 2>/dev/null || true)"
-      printf 'Web UI：%s\n端口：%s\n' "$(localize_service_state "$state")" "$(web_ui_port)"
+      printf 'Web UI：%s\n服务监听：0.0.0.0:%s\n浏览器访问：http://服务器IP:%s\n' \
+        "$(localize_service_state "$state")" "$(web_ui_port)" "$(web_ui_port)"
+      if [[ "$state" == failed ]]; then
+        error '错误点请查看下方 systemd 日志，重点关注启动命令、端口占用和仓库配置报错。'
+        journalctl -u kopia-web-ui.service -n 60 --no-pager 2>&1 || true
+      fi
       ;;
     docker)
-      state="$(docker inspect --format '{{.State.Status}}' kopia-web-ui 2>/dev/null || true)"
-      printf 'Web UI 容器：%s\n端口：%s\n' "$(localize_service_state "$state")" "$(web_ui_port)"
+      require_docker || return 1
+      if ! IFS='|' read -r state restarting restart_count exit_code oom_killed finished_at state_error < <(
+        docker inspect --format '{{.State.Status}}|{{.State.Restarting}}|{{.RestartCount}}|{{.State.ExitCode}}|{{.State.OOMKilled}}|{{.State.FinishedAt}}|{{.State.Error}}' kopia-web-ui 2>/dev/null
+      ); then
+        error '未找到 Web UI 容器。请先选择“启用 Web UI”创建容器。'
+        return 1
+      fi
+      container_address="$(docker inspect --format '{{range .Config.Cmd}}{{println .}}{{end}}' kopia-web-ui 2>/dev/null | sed -n 's/^--address=//p' | tail -n 1)"
+      host_bindings="$(docker inspect --format '{{range $containerPort, $bindings := .NetworkSettings.Ports}}{{range $bindings}}{{printf "%s:%s -> %s\\n" .HostIp .HostPort $containerPort}}{{end}}{{end}}' kopia-web-ui 2>/dev/null | sed '/^$/d')"
+      container_address="${container_address:-未检测到}"
+
+      printf 'Web UI 容器：%s\n容器内监听：%s\n' "$(localize_service_state "$state")" "$container_address"
+      if [[ -n "$host_bindings" ]]; then
+        printf '宿主机端口映射：\n%s\n' "$host_bindings"
+        browser_port="$(printf '%s\n' "$host_bindings" | sed -n '1{s/.*://; s/ ->.*//; p;}')"
+        printf '浏览器访问：http://服务器IP:%s\n' "${browser_port:-$(web_ui_port)}"
+        if [[ "$host_bindings" != *'0.0.0.0:'* && "$host_bindings" != *':::'* ]]; then
+          warn '端口仅绑定到指定宿主机地址；远程浏览器无法访问时，请检查端口映射和防火墙。'
+        fi
+      else
+        error '错误点：未检测到宿主机端口映射，外部浏览器无法访问容器 Web UI。'
+      fi
+      printf '重启次数：%s\n最近退出码：%s\n' "${restart_count:-0}" "${exit_code:-未知}"
+      [[ "$oom_killed" != true ]] || error '错误点：容器因内存不足（OOM）被系统终止。请增加可用内存或降低服务器负载。'
+      [[ -z "$state_error" ]] || error "Docker 错误：${state_error}"
+      [[ "$finished_at" == 0001-* || -z "$finished_at" ]] || printf '最近退出时间：%s\n' "$finished_at"
+
+      case "$state" in
+        running) success 'Web UI 容器正在正常运行。' ;;
+        restarting)
+          error '异常：容器启动后立即退出，Docker 正在按照重启策略反复尝试启动。'
+          info '下方最近日志通常包含可直接修正的错误点。重点检查端口占用、登录参数和仓库配置。'
+          docker logs --tail 60 kopia-web-ui 2>&1 || true
+          ;;
+        exited|dead)
+          error '异常：容器已退出，无法提供 Web UI 服务。'
+          info '下方最近日志通常包含可直接修正的错误点。重点检查端口占用、登录参数和仓库配置。'
+          docker logs --tail 60 kopia-web-ui 2>&1 || true
+          ;;
+        created|paused|removing) warn '容器当前不能提供 Web UI 服务。请稍后刷新状态；若状态持续不变，请查看 Web UI 日志。' ;;
+        *) warn '无法确认容器是否可用。请查看 Web UI 日志。' ;;
+      esac
       ;;
   esac
 }
@@ -835,6 +888,7 @@ web_ui_runtime_status() {
       state="$(docker inspect --format '{{.State.Status}}' kopia-web-ui 2>/dev/null || true)"
       case "$state" in
         running) printf '%s运行中%s' "$GREEN" "$RESET" ;;
+        restarting) printf '%s正在反复重启（异常）%s' "$RED" "$RESET" ;;
         exited|dead) printf '%s异常停止%s' "$RED" "$RESET" ;;
         *) printf '%s已启用，未运行%s' "$YELLOW" "$RESET" ;;
       esac
