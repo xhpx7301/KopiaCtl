@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.16"
+readonly MANAGER_VERSION="1.0.17"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -92,7 +92,13 @@ config_value() { [[ -f "$CONFIG_FILE" ]] && sed -n "s/^$1=//p" "$CONFIG_FILE" | 
 current_mode() { local mode; mode="$(config_value INSTALL_MODE)"; [[ "$mode" == docker ]] && printf 'docker\n' || printf 'native\n'; }
 web_ui_enabled() { [[ "$(config_value WEB_UI_ENABLED)" == true ]]; }
 web_ui_port() { local port; port="$(config_value WEB_UI_PORT)"; printf '%s\n' "${port:-$DEFAULT_WEB_UI_PORT}"; }
-web_ui_user() { local user; user="$(config_value WEB_UI_USERNAME)"; printf '%s\n' "${user:-admin}"; }
+web_ui_user() {
+  local user password
+  user="$(config_value WEB_UI_USERNAME)"
+  password="$(config_value WEB_UI_PASSWORD)"
+  [[ "$user" == admin && -z "$password" ]] && user=pingzi
+  printf '%s\n' "${user:-pingzi}"
+}
 
 localize_mode() {
   case "$1" in
@@ -113,7 +119,7 @@ localize_service_state() {
 }
 
 write_config() {
-  local mode="$1" enabled="${2:-false}" user="${3:-admin}" password="${4:-}" port="${5:-$DEFAULT_WEB_UI_PORT}"
+  local mode="$1" enabled="${2:-false}" user="${3:-pingzi}" password="${4:-}" port="${5:-$DEFAULT_WEB_UI_PORT}"
   install -d -m 0750 "$INSTALL_DIR" "$(dirname "$KOPIA_CONFIG_FILE")" "$CACHE_DIR"
   cat >"$CONFIG_FILE" <<EOF
 # 由 KopiaCtl 管理。R2 密钥仅保存在 Kopia 的 repository.config 中。
@@ -127,7 +133,7 @@ EOF
 }
 
 ensure_config() {
-  [[ -f "$CONFIG_FILE" ]] || write_config native false admin '' "$DEFAULT_WEB_UI_PORT"
+  [[ -f "$CONFIG_FILE" ]] || write_config native false pingzi '' "$DEFAULT_WEB_UI_PORT"
 }
 
 install_manager_command() {
@@ -500,8 +506,15 @@ EOF
 
 valid_web_ui_value() { [[ "$1" =~ ^[A-Za-z0-9@%+=_,.!:-]+$ ]]; }
 
+generate_web_ui_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 16 && return 0
+  fi
+  od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
+}
+
 configure_web_ui_credentials() {
-  local enabled="${1:-true}" user password confirm port default_user default_port
+  local enabled="${1:-true}" user password confirm port default_user default_port password_mode
   default_user="$(web_ui_user)"
   default_port="$(web_ui_port)"
   read -r -p "Web UI 用户名 [${default_user}]：" user
@@ -509,14 +522,29 @@ configure_web_ui_credentials() {
   read -r -p "监听端口 [${default_port}]：" port
   port="${port:-$default_port}"
   [[ "$port" =~ ^[1-9][0-9]{0,4}$ && "$port" -le 65535 ]] || { error '端口必须在 1-65535 之间。'; return 1; }
-  read_secret_with_length '设置 Web UI 密码（至少 12 位，仅允许字母、数字和 @%+=_,.!:-）' || return 1
-  password="$REPLY"
-  read_secret_with_length '再次输入 Web UI 密码' || return 1
-  confirm="$REPLY"
-  if [[ "$password" != "$confirm" || ${#password} -lt 12 ]] || ! valid_web_ui_value "$password"; then
-    error '密码不匹配、长度不足或包含不支持的字符。'
-    return 1
-  fi
+  printf '\nWeb UI 密码方式：\n'
+  printf '  1. 生成随机密码（默认，32 位十六进制）\n'
+  printf '  2. 自定义密码（至少 12 位，建议 16 位以上）\n'
+  read -r -p '请选择 [1-2，默认1]：' password_mode
+  password_mode="${password_mode:-1}"
+  case "$password_mode" in
+    1)
+      password="$(generate_web_ui_password)" || { error '生成随机密码失败。'; return 1; }
+      [[ ${#password} -eq 32 ]] || { error '生成的随机密码长度异常。'; return 1; }
+      printf '\n%s请保存随机 Web UI 密码：%s%s\n' "$YELLOW" "$password" "$RESET"
+      ;;
+    2)
+      read_secret_with_length '设置 Web UI 密码（至少 12 位，仅允许字母、数字和 @%+=_,.!:-）' || return 1
+      password="$REPLY"
+      read_secret_with_length '再次输入 Web UI 密码' || return 1
+      confirm="$REPLY"
+      if [[ "$password" != "$confirm" || ${#password} -lt 12 ]] || ! valid_web_ui_value "$password"; then
+        error '密码不匹配、长度不足或包含不支持的字符。'
+        return 1
+      fi
+      ;;
+    *) error '无效选项。'; return 1 ;;
+  esac
   valid_web_ui_value "$user" || { error '用户名包含不支持的字符。'; return 1; }
   write_config "$(current_mode)" "$enabled" "$user" "$password" "$port"
 }
