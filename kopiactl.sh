@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.15"
+readonly MANAGER_VERSION="1.0.16"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -39,8 +39,15 @@ confirm_action() { local answer; read -r -p "$1 [y/n，回车默认n]：" answer
 timestamp() { date '+%Y%m%d-%H%M%S'; }
 manager_source() { readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}"; }
 
+secret_character_count() {
+  local LC_ALL=C.UTF-8
+  printf '%d' "${#1}"
+}
+
 read_secret_with_length() {
   local label="$1" character='' value='' length
+  # read -n bypasses readline, so disable bracketed paste to avoid counting its control bytes.
+  printf '\033[?2004l'
   printf '%s [已输入 0 位]：' "$label"
   while true; do
     IFS= read -r -s -n 1 character || { printf '\n'; return 1; }
@@ -49,7 +56,7 @@ read_secret_with_length() {
       $'\177'|$'\b') [[ -z "$value" ]] || value="${value%?}" ;;
       *) value+="$character" ;;
     esac
-    length=${#value}
+    length="$(secret_character_count "$value")"
     printf '\r%s [已输入 %d 位]：' "$label" "$length"
   done
   printf '\n'
