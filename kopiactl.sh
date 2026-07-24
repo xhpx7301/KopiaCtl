@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.7"
+readonly MANAGER_VERSION="1.0.8"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -36,6 +36,23 @@ pause_menu() { printf '\n'; read -r -p '按回车键返回主菜单...' _ || tru
 confirm_action() { local answer; read -r -p "$1 [y/n，回车默认n]：" answer || return 1; [[ "$answer" =~ ^[Yy]$ ]]; }
 timestamp() { date '+%Y%m%d-%H%M%S'; }
 manager_source() { readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}"; }
+
+read_secret_with_length() {
+  local label="$1" character='' value='' length
+  printf '%s [已输入 0 位]：' "$label"
+  while true; do
+    IFS= read -r -s -n 1 character || { printf '\n'; return 1; }
+    case "$character" in
+      '') break ;;
+      $'\177'|$'\b') [[ -z "$value" ]] || value="${value%?}" ;;
+      *) value+="$character" ;;
+    esac
+    length=${#value}
+    printf '\r%s [已输入 %d 位]：' "$label" "$length"
+  done
+  printf '\n'
+  REPLY="$value"
+}
 
 show_command_usage() {
   cat <<'USAGE'
@@ -291,8 +308,8 @@ run_kopia_with_repository_password() {
 
 ensure_repository_password() {
   [[ -n "$REPOSITORY_PASSWORD" ]] && return 0
-  read -r -s -p '请输入 Kopia 仓库密码（不是 R2 Secret Access Key，输入不回显）：' REPOSITORY_PASSWORD
-  printf '\n'
+  read_secret_with_length '请输入 Kopia 仓库密码（不是 R2 Secret Access Key）' || return 1
+  REPOSITORY_PASSWORD="$REPLY"
   [[ -n "$REPOSITORY_PASSWORD" ]] || { error 'Kopia 仓库密码不能为空。'; return 1; }
 }
 
@@ -303,6 +320,40 @@ run_kopia_authenticated() {
     error '无法打开 Kopia 仓库。请检查仓库密码后重试。'
     return 1
   fi
+}
+
+check_r2_endpoint() {
+  local endpoint="$1" http_code
+  if ! command -v curl >/dev/null 2>&1; then
+    warn '未找到 curl，跳过 R2 网络预检。'
+    return 0
+  fi
+  info "正在检查 R2 endpoint 网络（最长 15 秒）：${endpoint}"
+  http_code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 15 "https://${endpoint}" 2>/dev/null || true)"
+  case "$http_code" in
+    ''|000)
+      error '无法在 15 秒内连接 R2 endpoint。请检查服务器 DNS、IPv6/IPv4 路由、防火墙和 TCP 443 出站访问。'
+      return 1
+      ;;
+    *)
+      success "R2 endpoint 可达（HTTP ${http_code}；403 或 400 对未签名探测请求属正常现象）。"
+      ;;
+  esac
+}
+
+run_with_progress() {
+  local description="$1" pid elapsed=0 result
+  shift
+  "$@" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r%s[处理中]%s %s（已等待 %d 秒，Ctrl+C 可取消）' "$BLUE" "$RESET" "$description" "$elapsed"
+    sleep 1
+    ((elapsed++))
+  done
+  wait "$pid"; result=$?
+  printf '\r%*s\r' 100 ''
+  return "$result"
 }
 
 configure_r2_repository() {
@@ -317,22 +368,25 @@ configure_r2_repository() {
   read -r -p 'Cloudflare Account ID：' account_id
   read -r -p 'R2 Bucket 名称：' bucket
   read -r -p 'R2 Access Key ID：' access_key
-  read -r -s -p 'R2 Secret Access Key（输入不回显）：' secret_key; printf '\n'
+  read_secret_with_length 'R2 Secret Access Key' || return 1
+  secret_key="$REPLY"
   [[ -n "$account_id" && -n "$bucket" && -n "$access_key" && -n "$secret_key" ]] || { error 'Account ID、Bucket 与 R2 密钥均不能为空。'; return 1; }
   endpoint="${account_id}.r2.cloudflarestorage.com"
+  check_r2_endpoint "$endpoint" || return 1
   if [[ "$action" == 2 ]]; then
     warn '创建操作会在指定 Bucket 写入新的 Kopia 仓库数据。Bucket 必须为空。'
     confirm_action "确认在 R2 Bucket ${bucket} 创建仓库？" || { info '已取消。'; return 0; }
-    read -r -s -p '请设置新的 Kopia 仓库密码（与 R2 Secret Access Key 不同，输入不回显）：' repository_password; printf '\n'
-    read -r -s -p '再次输入 Kopia 仓库密码：' password_confirm; printf '\n'
+    read_secret_with_length '请设置新的 Kopia 仓库密码（与 R2 Secret Access Key 不同）' || return 1
+    repository_password="$REPLY"
+    read_secret_with_length '再次输入 Kopia 仓库密码' || return 1
+    password_confirm="$REPLY"
     [[ -n "$repository_password" && "$repository_password" == "$password_confirm" ]] || { error '仓库密码不能为空，且两次输入必须一致。'; return 1; }
-    info '正在创建 Kopia 仓库并连接 Cloudflare R2...'
-    run_kopia_with_repository_password "$repository_password" repository create s3 --bucket="$bucket" --endpoint="$endpoint" --region=auto --access-key="$access_key" --secret-access-key="$secret_key" || return 1
+    run_with_progress '正在创建 Kopia 仓库并连接 Cloudflare R2' run_kopia_with_repository_password "$repository_password" repository create s3 --bucket="$bucket" --endpoint="$endpoint" --region=auto --access-key="$access_key" --secret-access-key="$secret_key" || return 1
   else
-    read -r -s -p '请输入已有 Kopia 仓库密码（不是 R2 Secret Access Key，输入不回显）：' repository_password; printf '\n'
+    read_secret_with_length '请输入已有 Kopia 仓库密码（不是 R2 Secret Access Key）' || return 1
+    repository_password="$REPLY"
     [[ -n "$repository_password" ]] || { error 'Kopia 仓库密码不能为空。'; return 1; }
-    info '正在验证仓库密码并连接 Cloudflare R2...'
-    run_kopia_with_repository_password "$repository_password" repository connect s3 --bucket="$bucket" --endpoint="$endpoint" --region=auto --access-key="$access_key" --secret-access-key="$secret_key" || return 1
+    run_with_progress '正在验证仓库密码并连接 Cloudflare R2' run_kopia_with_repository_password "$repository_password" repository connect s3 --bucket="$bucket" --endpoint="$endpoint" --region=auto --access-key="$access_key" --secret-access-key="$secret_key" || return 1
   fi
   REPOSITORY_PASSWORD="$repository_password"
   success "Cloudflare R2 仓库已配置：${bucket}。R2 密钥已由 Kopia 加密保存；本次菜单会话无需再次输入仓库密码。"
@@ -431,8 +485,10 @@ configure_web_ui_credentials() {
   read -r -p "监听端口 [${default_port}]：" port
   port="${port:-$default_port}"
   [[ "$port" =~ ^[1-9][0-9]{0,4}$ && "$port" -le 65535 ]] || { error '端口必须在 1-65535 之间。'; return 1; }
-  read -r -s -p '设置 Web UI 密码（至少 12 位，仅允许字母、数字和 @%+=_,.!:-）：' password; printf '\n'
-  read -r -s -p '再次输入密码：' confirm; printf '\n'
+  read_secret_with_length '设置 Web UI 密码（至少 12 位，仅允许字母、数字和 @%+=_,.!:-）' || return 1
+  password="$REPLY"
+  read_secret_with_length '再次输入 Web UI 密码' || return 1
+  confirm="$REPLY"
   if [[ "$password" != "$confirm" || ${#password} -lt 12 ]] || ! valid_web_ui_value "$password"; then
     error '密码不匹配、长度不足或包含不支持的字符。'
     return 1
