@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.0"
+readonly MANAGER_VERSION="1.0.1"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -262,9 +262,12 @@ native_kopia() {
 }
 
 docker_kopia() {
+  local -a password_env=()
   require_docker || return 1
   install -d -m 0750 "$(dirname "$KOPIA_CONFIG_FILE")" "$CACHE_DIR"
+  [[ -z "${KOPIA_PASSWORD:-}" ]] || password_env=(-e KOPIA_PASSWORD)
   docker run --rm \
+    "${password_env[@]}" \
     -v "$(dirname "$KOPIA_CONFIG_FILE"):/app/config" \
     -v "$CACHE_DIR:/app/cache" \
     "$KOPIA_IMAGE" --config-file=/app/config/repository.config "$@"
@@ -277,8 +280,14 @@ run_kopia() {
   esac
 }
 
+run_kopia_with_repository_password() {
+  local repository_password="$1"
+  shift
+  KOPIA_PASSWORD="$repository_password" run_kopia "$@"
+}
+
 configure_r2_repository() {
-  local action account_id bucket access_key secret_key endpoint
+  local action account_id bucket access_key secret_key endpoint repository_password password_confirm
   printf '\n%sCloudflare R2 仓库配置%s\n' "$BOLD" "$RESET"
   printf '  1. 连接已有 R2 仓库（默认）\n'
   printf '  2. 在空 R2 Bucket 中创建新仓库\n'
@@ -295,9 +304,16 @@ configure_r2_repository() {
   if [[ "$action" == 2 ]]; then
     warn '创建操作会在指定 Bucket 写入新的 Kopia 仓库数据。Bucket 必须为空。'
     confirm_action "确认在 R2 Bucket ${bucket} 创建仓库？" || { info '已取消。'; return 0; }
-    run_kopia repository create s3 --bucket="$bucket" --endpoint="$endpoint" --region=auto --access-key="$access_key" --secret-access-key="$secret_key" || return 1
+    read -r -s -p '请设置新的 Kopia 仓库密码（与 R2 Secret Access Key 不同，输入不回显）：' repository_password; printf '\n'
+    read -r -s -p '再次输入 Kopia 仓库密码：' password_confirm; printf '\n'
+    [[ -n "$repository_password" && "$repository_password" == "$password_confirm" ]] || { error '仓库密码不能为空，且两次输入必须一致。'; return 1; }
+    info '正在创建 Kopia 仓库并连接 Cloudflare R2...'
+    run_kopia_with_repository_password "$repository_password" repository create s3 --bucket="$bucket" --endpoint="$endpoint" --region=auto --access-key="$access_key" --secret-access-key="$secret_key" || return 1
   else
-    run_kopia repository connect s3 --bucket="$bucket" --endpoint="$endpoint" --region=auto --access-key="$access_key" --secret-access-key="$secret_key" || return 1
+    read -r -s -p '请输入已有 Kopia 仓库密码（不是 R2 Secret Access Key，输入不回显）：' repository_password; printf '\n'
+    [[ -n "$repository_password" ]] || { error 'Kopia 仓库密码不能为空。'; return 1; }
+    info '正在验证仓库密码并连接 Cloudflare R2...'
+    run_kopia_with_repository_password "$repository_password" repository connect s3 --bucket="$bucket" --endpoint="$endpoint" --region=auto --access-key="$access_key" --secret-access-key="$secret_key" || return 1
   fi
   success "Cloudflare R2 仓库已配置：${bucket}。R2 密钥已由 Kopia 加密保存。"
 }
@@ -552,6 +568,7 @@ draw_menu() {
   printf '  0. 退出\n'
   printf '%s============================================%s\n' "$BLUE" "$RESET"
   printf '提示：默认原生安装、Cloudflare R2 仓库、Web UI 关闭。\n'
+  printf '提示：退出后可在终端输入 kopiactl 再次打开本菜单。\n'
 }
 
 main_menu() {
