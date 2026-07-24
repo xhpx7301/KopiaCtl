@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.6"
+readonly MANAGER_VERSION="1.0.7"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -566,17 +566,10 @@ show_logs() {
 }
 
 show_status() {
-  local repository_state
   printf '\n%sKopia 状态%s\n' "$BOLD" "$RESET"
-  printf '安装方式：%s\n配置目录：%s\n' "$(localize_mode "$(current_mode)")" "$INSTALL_DIR"
-  printf 'Web UI 默认启用：%s\n' "$(web_ui_enabled && printf '是' || printf '否')"
-  show_web_ui_status
-  if [[ -f "$KOPIA_CONFIG_FILE" ]]; then
-    repository_state='已配置（可通过“查看仓库状态”验证连接）'
-  else
-    repository_state='未配置'
-  fi
-  printf '仓库：%s\n' "$repository_state"
+  printf 'Kopia：%s\nWeb UI：%s\n' "$(kopia_runtime_status)" "$(web_ui_runtime_status)"
+  printf '仓库：%s\n配置方式：%s\n配置目录：%s\n' \
+    "$(repository_config_status)" "${BLUE}$(localize_mode "$(current_mode)")${RESET}" "$INSTALL_DIR"
 }
 
 show_repository_status() { run_kopia_authenticated repository status; }
@@ -624,11 +617,68 @@ uninstall_menu() {
   esac
 }
 
+docker_runtime_status() {
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '%sDocker 未安装%s' "$RED" "$RESET"
+  elif docker info >/dev/null 2>&1; then
+    printf '%sDocker 已就绪%s' "$GREEN" "$RESET"
+  else
+    printf '%sDocker 服务不可用%s' "$RED" "$RESET"
+  fi
+}
+
+kopia_runtime_status() {
+  case "$(current_mode)" in
+    native)
+      if command -v kopia >/dev/null 2>&1; then
+        printf '%s原生已安装%s' "$GREEN" "$RESET"
+      else
+        printf '%s未安装%s' "$RED" "$RESET"
+      fi
+      ;;
+    docker) printf '%s' "$(docker_runtime_status)" ;;
+  esac
+}
+
+web_ui_runtime_status() {
+  local state
+  if ! web_ui_enabled; then
+    printf '%s未启用%s' "$YELLOW" "$RESET"
+    return
+  fi
+  case "$(current_mode)" in
+    native)
+      state="$(systemctl is-active kopia-web-ui.service 2>/dev/null || true)"
+      case "$state" in
+        active) printf '%s运行中%s' "$GREEN" "$RESET" ;;
+        failed) printf '%s启动失败%s' "$RED" "$RESET" ;;
+        *) printf '%s已启用，未运行%s' "$YELLOW" "$RESET" ;;
+      esac
+      ;;
+    docker)
+      state="$(docker inspect --format '{{.State.Status}}' kopia-web-ui 2>/dev/null || true)"
+      case "$state" in
+        running) printf '%s运行中%s' "$GREEN" "$RESET" ;;
+        exited|dead) printf '%s异常停止%s' "$RED" "$RESET" ;;
+        *) printf '%s已启用，未运行%s' "$YELLOW" "$RESET" ;;
+      esac
+      ;;
+  esac
+}
+
+repository_config_status() {
+  if [[ -f "$KOPIA_CONFIG_FILE" ]]; then
+    printf '%s已配置%s' "$GREEN" "$RESET"
+  else
+    printf '%s未配置%s' "$YELLOW" "$RESET"
+  fi
+}
+
 status_line() {
-  local mode web
-  mode="$(current_mode)"
-  web="$(web_ui_enabled && printf '已启用' || printf '默认关闭')"
-  printf '安装：%s | Web UI：%s | KopiaCtl：%s\n' "$(localize_mode "$mode")" "$web" "$MANAGER_VERSION"
+  printf 'Kopia：%s | Web UI：%s\n' "$(kopia_runtime_status)" "$(web_ui_runtime_status)"
+  printf '仓库：%s | 配置方式：%s\n' \
+    "$(repository_config_status)" "${BLUE}$(localize_mode "$(current_mode)")${RESET}"
+  printf 'KopiaCtl 版本：%s\n' "$MANAGER_VERSION"
 }
 
 draw_menu() {
