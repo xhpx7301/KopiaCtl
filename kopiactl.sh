@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.11"
+readonly MANAGER_VERSION="1.0.12"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -812,7 +812,6 @@ draw_menu() {
   printf '  8. 查询快照并恢复\n'
   printf '  9. Web UI 管理\n'
   printf ' 10. 查看 Web UI 日志\n'
-  printf '\n'
   printf ' 11. 备份本地 Kopia 配置\n'
   printf ' 12. 卸载 Kopia 或 KopiaCtl\n'
   printf '  0. 退出\n'
