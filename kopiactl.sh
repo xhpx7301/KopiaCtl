@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.14"
+readonly MANAGER_VERSION="1.0.15"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -22,6 +22,7 @@ readonly DEFAULT_WEB_UI_PORT="51515"
 # Only retained for the lifetime of the interactive menu process.
 REPOSITORY_PASSWORD=''
 MANAGER_UPDATED=false
+FULL_UNINSTALL_DONE=false
 
 if [[ -t 1 ]]; then
   readonly RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m' BLUE=$'\033[34m' BOLD=$'\033[1m' RESET=$'\033[0m'
@@ -724,6 +725,7 @@ uninstall_everything() {
   systemctl daemon-reload
   remove_manager_files
   rm -rf -- "$INSTALL_DIR" "$BACKUP_DIR"
+  FULL_UNINSTALL_DONE=true
   success 'Kopia、KopiaCtl、本地配置和备份均已删除；R2 远端快照未受影响。'
 }
 
@@ -869,7 +871,15 @@ main_menu() {
       9) web_ui_menu ;;
       10) show_logs; pause_menu ;;
       11) backup_local_config; pause_menu ;;
-      12) uninstall_menu; pause_menu ;;
+      12)
+        uninstall_menu
+        if [[ "$FULL_UNINSTALL_DONE" == true ]]; then
+          printf '\n'
+          read -r -p '完全卸载已完成，按回车键退出...' _ || true
+          exit 0
+        fi
+        pause_menu
+        ;;
       0) exit 0 ;;
       *) warn '无效选项。'; pause_menu ;;
     esac
