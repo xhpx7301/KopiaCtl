@@ -6,7 +6,7 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 两种部署方式 | 可选择原生 Kopia 或 Docker 容器。切换时保留同一份 Kopia 仓库配置。 |
+| 两种部署方式 | 可安装原生 Kopia 或 Docker Kopia。Docker 模式会安装 Docker Engine/Compose 并下载 `kopia/kopia` 镜像；切换时保留同一份仓库配置。 |
 | Cloudflare R2 | 引导连接已有仓库，或在空 R2 Bucket 中创建新仓库。R2 密钥由 Kopia 的仓库配置保存，不写入 KopiaCtl 菜单配置。 |
 | 快照与恢复 | 交互式创建快照、列出快照；恢复前会自动显示可恢复快照列表，再输入要恢复的快照 ID。Docker 模式会临时只读挂载备份路径。 |
 | Web UI | 默认关闭；可单独启用、启动、停止、查看或修改登录凭据。原生模式使用 systemd，Docker 模式使用 Compose profile。 |
@@ -19,7 +19,7 @@
 | 系统 | 使用 systemd 的 Debian 或 Ubuntu（自动安装基于 apt）。 |
 | 权限 | root，或具有 sudo 权限的交互式 SSH 终端。 |
 | R2 | 一个已创建的 Bucket，以及具备该 Bucket 读写权限的 R2 Access Key。 |
-| Docker 模式 | Docker Engine 与 Docker Compose v2；KopiaCtl 可协助从系统软件源安装。 |
+| Docker 模式 | Docker Engine 与 Docker Compose v2；KopiaCtl 会从系统软件源安装运行时并拉取 Kopia 镜像。 |
 
 ## 安装
 

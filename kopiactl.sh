@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.13"
+readonly MANAGER_VERSION="1.0.14"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -208,6 +208,19 @@ install_docker() {
   require_docker && success 'Docker Engine 与 Compose 已就绪。'
 }
 
+install_docker_kopia() {
+  install_docker || return 1
+  require_docker || return 1
+  if docker image inspect "$KOPIA_IMAGE" >/dev/null 2>&1; then
+    success "Kopia Docker 镜像已安装：${KOPIA_IMAGE}"
+  else
+    info "正在下载 Kopia Docker 镜像：${KOPIA_IMAGE}"
+    docker pull "$KOPIA_IMAGE" || { error 'Kopia Docker 镜像下载失败。'; return 1; }
+    success "Kopia Docker 镜像已安装：${KOPIA_IMAGE}"
+  fi
+  write_compose_file
+}
+
 write_compose_file() {
   install -d -m 0750 "$INSTALL_DIR" "$(dirname "$KOPIA_CONFIG_FILE")" "$CACHE_DIR"
   cat >"$COMPOSE_FILE" <<EOF
@@ -249,7 +262,7 @@ configure_mode() {
   fi
   case "$selected" in
     native) install_native_kopia || return 1 ;;
-    docker) install_docker || return 1; write_compose_file ;;
+    docker) install_docker_kopia || return 1 ;;
   esac
   if [[ "$selected" != "$current" && "$enabled" == true ]]; then
     stop_web_ui
@@ -258,17 +271,17 @@ configure_mode() {
   ensure_config
   write_config "$selected" "$enabled" "$user" "$password" "$port"
   if [[ "$enabled" == true ]]; then
-    success "已确认 $(localize_mode "$selected")。Web UI 保持启用状态。"
+    success "Kopia 已按 $(localize_mode "$selected") 就绪。Web UI 保持启用状态。"
   else
-    success "已选择 $(localize_mode "$selected")。Web UI 保持默认关闭。"
+    success "Kopia 已按 $(localize_mode "$selected") 就绪。Web UI 保持默认关闭。"
   fi
 }
 
 choose_install_mode() {
   local selected
-  printf '\n当前安装方式：%s\n' "$(localize_mode "$(current_mode)")"
-  printf '  1. 原生安装（默认，适合资源紧张的服务器）\n'
-  printf '  2. Docker 容器（适合统一容器化运维）\n'
+  printf '\n当前配置方式：%s\n' "$(localize_mode "$(current_mode)")"
+  printf '  1. 安装原生 Kopia（默认，适合资源紧张的服务器）\n'
+  printf '  2. 安装 Docker Kopia（安装 Docker 并下载 Kopia 镜像）\n'
   printf '  0. 返回\n'
   read -r -p '请选择 [0-2]：' selected
   case "$selected" in
@@ -520,8 +533,7 @@ start_web_ui() {
       systemctl enable --now kopia-web-ui.service || { error 'Web UI 启动失败。请查看日志。'; return 1; }
       ;;
     docker)
-      install_docker || return 1
-      [[ -f "$COMPOSE_FILE" ]] || write_compose_file
+      install_docker_kopia || return 1
       (cd "$INSTALL_DIR" && docker compose --profile web up -d) || { error 'Web UI 容器启动失败。'; return 1; }
       ;;
   esac
@@ -627,7 +639,8 @@ show_logs() {
 
 show_status() {
   printf '\n%sKopia 状态%s\n' "$BOLD" "$RESET"
-  printf 'Kopia：%s\nWeb UI：%s\n' "$(kopia_runtime_status)" "$(web_ui_runtime_status)"
+  printf 'Kopia：%s\nDocker：%s\nWeb UI：%s\n' \
+    "$(kopia_runtime_status)" "$(docker_runtime_status)" "$(web_ui_runtime_status)"
   printf '仓库：%s\n配置方式：%s\n配置目录：%s\n' \
     "$(repository_config_status)" "${BLUE}$(localize_mode "$(current_mode)")${RESET}" "$INSTALL_DIR"
 }
@@ -741,6 +754,18 @@ docker_runtime_status() {
   fi
 }
 
+docker_kopia_image_status() {
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '%s未安装（Docker 未安装）%s' "$RED" "$RESET"
+  elif ! docker info >/dev/null 2>&1; then
+    printf '%s未安装（Docker 服务不可用）%s' "$RED" "$RESET"
+  elif docker image inspect "$KOPIA_IMAGE" >/dev/null 2>&1; then
+    printf '%sDocker 镜像已安装%s' "$GREEN" "$RESET"
+  else
+    printf '%sDocker 已就绪，镜像未下载%s' "$YELLOW" "$RESET"
+  fi
+}
+
 kopia_runtime_status() {
   case "$(current_mode)" in
     native)
@@ -750,7 +775,7 @@ kopia_runtime_status() {
         printf '%s未安装%s' "$RED" "$RESET"
       fi
       ;;
-    docker) printf '%s' "$(docker_runtime_status)" ;;
+    docker) printf '%s' "$(docker_kopia_image_status)" ;;
   esac
 }
 
@@ -790,8 +815,9 @@ repository_config_status() {
 
 status_line() {
   printf 'Kopia：%s | Web UI：%s\n' "$(kopia_runtime_status)" "$(web_ui_runtime_status)"
-  printf '仓库：%s | 配置方式：%s\n' \
-    "$(repository_config_status)" "${BLUE}$(localize_mode "$(current_mode)")${RESET}"
+  printf 'Docker：%s | 配置方式：%s\n' \
+    "$(docker_runtime_status)" "${BLUE}$(localize_mode "$(current_mode)")${RESET}"
+  printf '仓库：%s\n' "$(repository_config_status)"
   printf 'KopiaCtl 版本：%s\n' "$MANAGER_VERSION"
 }
 
@@ -804,7 +830,7 @@ draw_menu() {
   printf '%s--------------------------------------------%s\n' "$BLUE" "$RESET"
   printf '  1. 更新 KopiaCtl 管理菜单\n'
   printf '  2. 查看运行状态\n'
-  printf '  3. 选择安装方式（原生 / Docker）\n'
+  printf '  3. 安装 Kopia（原生 / Docker）\n'
   printf '  4. 配置 Cloudflare R2 仓库\n'
   printf '  5. 查看仓库状态\n'
   printf '  6. 创建快照备份\n'
