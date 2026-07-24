@@ -46,7 +46,7 @@ kopiactl
 
 建议的首次操作顺序：选择安装方式（小型服务器选原生安装）→ 配置 Cloudflare R2 仓库 → 创建首个快照。Web UI 仅在确有浏览器管理需求时从菜单启用。
 
-R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Access Key。KopiaCtl 自动使用 `<Account ID>.r2.cloudflarestorage.com` 作为 S3 endpoint，使用 `region=auto`。连接已有仓库时还需要输入该 Kopia 仓库的加密密码；它不是 R2 Secret Access Key。创建新仓库时，菜单会要求设置并确认这个密码。仓库密码仅保留在当前菜单进程的内存中，因此一次输入后可用于本次会话内的快照、恢复和仓库状态操作；退出菜单即清除。
+R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Access Key。KopiaCtl 自动使用 `<Account ID>.r2.cloudflarestorage.com` 作为 S3 endpoint，使用 `region=auto`。连接已有仓库时还需要输入该 Kopia 仓库的加密密码；它不是 R2 Secret Access Key。创建新仓库时，菜单会要求设置并确认这个密码。仓库密码通常仅保留在当前菜单进程的内存中；但 Docker Web UI 运行时必须将它保存到权限为 `0600` 的 `/opt/kopiactl/kopiactl.env`，以便后台容器通过 `KOPIA_PASSWORD` 打开仓库。停用 Web UI 时会清除该已保存的密码。
 
 ## 文件位置
 
@@ -69,7 +69,7 @@ R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Acc
 
 Web UI 默认关闭。启用后会监听 `0.0.0.0:51515`（可在菜单修改），默认用户名为 `pingzi`。密码方式默认生成 32 位十六进制随机密码（128 位随机熵），并在终端显示一次；也可改为自定义密码，最低 12 位，建议使用 16 位以上的随机密码或长口令。菜单可查看用户名、地址与密码状态；显示明文密码前需要再次确认。修改凭据会立即重启原生服务或重建 Docker 容器。`--insecure` 表示 Kopia 本身不提供 HTTPS；请仅通过内网、VPN、防火墙白名单访问，或放在反向代理的 HTTPS 与额外认证之后。不要直接向公网开放该端口。
 
-Docker 模式中显示“正在反复重启（异常）”表示容器一启动便退出，Docker 正按重启策略重复拉起它，Web UI 此时不可用。选择“查看 Web UI 状态”会显示容器内监听地址、宿主机实际端口映射和浏览器访问地址，以及重启次数、退出码、内存不足终止标记、Docker 错误和最近 60 行容器日志；日志末尾通常就是需要修正的具体原因。常见原因是端口被占用、仓库配置缺失或无效、登录参数不正确，或服务器内存不足。
+Docker 模式中显示“正在反复重启（异常）”表示容器一启动便退出，Docker 正按重启策略重复拉起它，Web UI 此时不可用。选择“查看 Web UI 状态”会显示容器内监听地址、宿主机实际端口映射和浏览器访问地址，以及重启次数、退出码、内存不足终止标记、Docker 错误和最近 60 行容器日志；日志末尾通常就是需要修正的具体原因。Docker Web UI 首次启用时会要求输入 Kopia 仓库密码并将其注入容器；如密码错误或仓库密码已更换，可从 Web UI 管理菜单选择“更新 Docker Web UI 仓库密码”。常见原因是端口被占用、仓库配置缺失或无效、登录参数不正确，或服务器内存不足。
 
 ## 注意事项
 

@@ -126,7 +126,12 @@ localize_service_state() {
 }
 
 write_config() {
-  local mode="$1" enabled="${2:-false}" user="${3:-pingzi}" password="${4:-}" port="${5:-$DEFAULT_WEB_UI_PORT}"
+  local mode="$1" enabled="${2:-false}" user="${3:-pingzi}" password="${4:-}" port="${5:-$DEFAULT_WEB_UI_PORT}" repository_password_entry
+  if (( $# >= 6 )); then
+    repository_password_entry="$6"
+  else
+    repository_password_entry="$(config_value KOPIA_REPOSITORY_PASSWORD)"
+  fi
   install -d -m 0750 "$INSTALL_DIR" "$(dirname "$KOPIA_CONFIG_FILE")" "$CACHE_DIR"
   cat >"$CONFIG_FILE" <<EOF
 # 由 KopiaCtl 管理。R2 密钥仅保存在 Kopia 的 repository.config 中。
@@ -135,6 +140,7 @@ WEB_UI_ENABLED=${enabled}
 WEB_UI_USERNAME=${user}
 WEB_UI_PASSWORD=${password}
 WEB_UI_PORT=${port}
+KOPIA_REPOSITORY_PASSWORD=${repository_password_entry}
 EOF
   chmod 0600 "$CONFIG_FILE"
 }
@@ -265,6 +271,8 @@ services:
     volumes:
       - ./config:/app/config
       - ./cache:/app/cache
+    environment:
+      KOPIA_PASSWORD: \${KOPIA_REPOSITORY_PASSWORD}
 EOF
   chmod 0640 "$COMPOSE_FILE"
 }
@@ -427,6 +435,13 @@ configure_r2_repository() {
   fi
   REPOSITORY_PASSWORD="$repository_password"
   success "Cloudflare R2 仓库已配置：${bucket}。R2 密钥已由 Kopia 加密保存；本次菜单会话无需再次输入仓库密码。"
+  if [[ "$(current_mode)" == docker ]] && web_ui_enabled; then
+    info '正在将新的仓库密码应用到 Docker Web UI...'
+    save_docker_web_ui_repository_password || return 1
+    write_compose_file
+    (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d --force-recreate) || { error 'Web UI 容器重建失败。'; return 1; }
+    success 'Docker Web UI 已连接到新的仓库配置。'
+  fi
 }
 
 create_snapshot() {
@@ -513,6 +528,27 @@ EOF
 
 valid_web_ui_value() { [[ "$1" =~ ^[A-Za-z0-9@%+=_,.!:-]+$ ]]; }
 
+compose_env_single_quote() {
+  local value="$1" single_quote="'"
+  value="${value//\\/\\\\}"
+  value="${value//"$single_quote"/\\$single_quote}"
+  printf "'%s'" "$value"
+}
+
+docker_web_ui_repository_password_configured() {
+  [[ -n "$(config_value KOPIA_REPOSITORY_PASSWORD)" ]]
+}
+
+save_docker_web_ui_repository_password() {
+  local password_entry enabled
+  [[ -f "$KOPIA_CONFIG_FILE" ]] || { error '尚未配置 Kopia 仓库。请先配置 Cloudflare R2 仓库。'; return 1; }
+  ensure_repository_password || return 1
+  password_entry="$(compose_env_single_quote "$REPOSITORY_PASSWORD")"
+  enabled="$(web_ui_enabled && printf true || printf false)"
+  write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$password_entry"
+  success 'Docker Web UI 的仓库密码已保存，并将仅以 KOPIA_PASSWORD 注入容器。'
+}
+
 generate_web_ui_password() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -hex 16 && return 0
@@ -577,6 +613,10 @@ start_web_ui() {
       ;;
     docker)
       install_docker_kopia || return 1
+      if ! docker_web_ui_repository_password_configured; then
+        info 'Docker Web UI 需要仓库密码才能在后台打开仓库。'
+        save_docker_web_ui_repository_password || return 1
+      fi
       (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d) || { error 'Web UI 容器启动失败。'; return 1; }
       ;;
   esac
@@ -593,7 +633,7 @@ stop_web_ui() {
       ;;
   esac
   ensure_config
-  write_config "$(current_mode)" false "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)"
+  write_config "$(current_mode)" false "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" ''
   success 'Kopia Web UI 已停止，并设为默认不启用。'
 }
 
@@ -605,8 +645,9 @@ web_ui_menu() {
   printf '  3. 查看 Web UI 状态\n'
   printf '  4. 查看 Web UI 登录凭据\n'
   printf '  5. 修改 Web UI 登录凭据\n'
+  printf '  6. 更新 Docker Web UI 仓库密码\n'
   printf '  0. 返回\n'
-  read -r -p '请选择 [0-5，直接回车返回]：' selected
+  read -r -p '请选择 [0-6，直接回车返回]：' selected
   case "$selected" in
     ''|0) return 0 ;;
     1) start_web_ui ;;
@@ -614,9 +655,23 @@ web_ui_menu() {
     3) show_web_ui_status ;;
     4) show_web_ui_credentials ;;
     5) modify_web_ui_credentials ;;
+    6) update_docker_web_ui_repository_password ;;
     *) error '无效选项。'; pause_menu; return 1 ;;
   esac
   pause_menu
+}
+
+update_docker_web_ui_repository_password() {
+  [[ "$(current_mode)" == docker ]] || { warn '仅 Docker 模式的 Web UI 需要保存仓库密码。'; return 0; }
+  info '请输入 Kopia 仓库密码。它不同于 Web UI 登录密码和 R2 Secret Access Key。'
+  REPOSITORY_PASSWORD=''
+  save_docker_web_ui_repository_password || return 1
+  if web_ui_enabled; then
+    require_docker || return 1
+    write_compose_file
+    (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d --force-recreate) || { error 'Web UI 容器重建失败。'; return 1; }
+    success 'Docker Web UI 已使用新的仓库密码重建。'
+  fi
 }
 
 show_web_ui_credentials() {
@@ -649,7 +704,7 @@ modify_web_ui_credentials() {
         ;;
       docker)
         require_docker || return 1
-        [[ -f "$COMPOSE_FILE" ]] || write_compose_file
+        write_compose_file
         (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d --force-recreate) || { error 'Web UI 容器重建失败。'; return 1; }
         ;;
     esac
