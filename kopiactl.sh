@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.5"
+readonly MANAGER_VERSION="1.0.6"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -486,8 +486,8 @@ stop_web_ui() {
 web_ui_menu() {
   local selected
   printf '\n当前 Web UI：%s\n' "$(web_ui_enabled && printf '已启用' || printf '未启用')"
-  printf '  1. 启用并启动 Web UI\n'
-  printf '  2. 停止并禁用 Web UI\n'
+  printf '  1. 启用 Web UI\n'
+  printf '  2. 停用 Web UI\n'
   printf '  3. 查看 Web UI 状态\n'
   printf '  4. 查看 Web UI 登录凭据\n'
   printf '  5. 修改 Web UI 登录凭据\n'
@@ -644,7 +644,7 @@ draw_menu() {
   printf '  4. 创建快照备份\n'
   printf '  5. 查看快照列表\n'
   printf '  6. 查询快照并恢复\n'
-  printf '  7. Web UI 启用、停止与状态\n'
+  printf '  7. Web UI 管理\n'
   printf '  8. 查看仓库状态\n'
   printf '  9. 查看 Web UI 日志\n'
   printf ' 10. 备份本地 Kopia 配置\n'
