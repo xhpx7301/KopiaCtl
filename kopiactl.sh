@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.17"
+readonly MANAGER_VERSION="1.0.18"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -238,7 +238,7 @@ install_docker_kopia() {
 write_compose_file() {
   install -d -m 0750 "$INSTALL_DIR" "$(dirname "$KOPIA_CONFIG_FILE")" "$CACHE_DIR"
   cat >"$COMPOSE_FILE" <<EOF
-# 由 KopiaCtl 管理。默认未启用 Web UI；使用 docker compose --profile web 启动。
+# 由 KopiaCtl 管理。默认未启用 Web UI；通过 kopiactl.env 向 Compose 提供登录配置。
 services:
   kopia-web-ui:
     image: ${KOPIA_IMAGE}
@@ -570,7 +570,7 @@ start_web_ui() {
       ;;
     docker)
       install_docker_kopia || return 1
-      (cd "$INSTALL_DIR" && docker compose --profile web up -d) || { error 'Web UI 容器启动失败。'; return 1; }
+      (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d) || { error 'Web UI 容器启动失败。'; return 1; }
       ;;
   esac
   success "Kopia Web UI 已启动：http://服务器IP:$(web_ui_port)"
@@ -582,7 +582,7 @@ stop_web_ui() {
       systemctl disable --now kopia-web-ui.service 2>/dev/null || true
       ;;
     docker)
-      [[ ! -f "$COMPOSE_FILE" ]] || (cd "$INSTALL_DIR" && docker compose --profile web stop 2>/dev/null || true)
+      [[ ! -f "$COMPOSE_FILE" ]] || (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web stop 2>/dev/null || true)
       ;;
   esac
   ensure_config
@@ -643,7 +643,7 @@ modify_web_ui_credentials() {
       docker)
         require_docker || return 1
         [[ -f "$COMPOSE_FILE" ]] || write_compose_file
-        (cd "$INSTALL_DIR" && docker compose --profile web up -d --force-recreate) || { error 'Web UI 容器重建失败。'; return 1; }
+        (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d --force-recreate) || { error 'Web UI 容器重建失败。'; return 1; }
         ;;
     esac
     success 'Web UI 登录凭据已修改并生效。'
