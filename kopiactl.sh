@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.8"
+readonly MANAGER_VERSION="1.0.9"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -548,16 +548,17 @@ web_ui_menu() {
   printf '  4. 查看 Web UI 登录凭据\n'
   printf '  5. 修改 Web UI 登录凭据\n'
   printf '  0. 返回\n'
-  read -r -p '请选择 [0-5]：' selected
+  read -r -p '请选择 [0-5，直接回车返回]：' selected
   case "$selected" in
+    ''|0) return 0 ;;
     1) start_web_ui ;;
     2) stop_web_ui ;;
     3) show_web_ui_status ;;
     4) show_web_ui_credentials ;;
     5) modify_web_ui_credentials ;;
-    0) return 0 ;;
-    *) error '无效选项。'; return 1 ;;
+    *) error '无效选项。'; pause_menu; return 1 ;;
   esac
+  pause_menu
 }
 
 show_web_ui_credentials() {
@@ -776,7 +777,7 @@ main_menu() {
       4) create_snapshot; pause_menu ;;
       5) list_snapshots; pause_menu ;;
       6) restore_snapshot; pause_menu ;;
-      7) web_ui_menu; pause_menu ;;
+      7) web_ui_menu ;;
       8) show_repository_status; pause_menu ;;
       9) show_logs; pause_menu ;;
       10) backup_local_config; pause_menu ;;
