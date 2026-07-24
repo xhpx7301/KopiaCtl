@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.2"
+readonly MANAGER_VERSION="1.0.3"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -364,7 +364,11 @@ list_snapshots() { run_kopia_authenticated snapshot list; }
 
 restore_snapshot() {
   local snapshot_id destination mode
-  read -r -p '请输入快照 ID：' snapshot_id
+  printf '\n%s可恢复快照%s\n' "$BOLD" "$RESET"
+  list_snapshots || return 1
+  printf '\n'
+  read -r -p '请输入上方列表中的快照 ID [输入0返回]：' snapshot_id
+  [[ "$snapshot_id" == 0 ]] && { info '已取消恢复。'; return 0; }
   read -r -p '请输入恢复目标的绝对路径（目录会被创建）：' destination
   [[ "$snapshot_id" =~ ^[A-Za-z0-9._:-]+$ && "$destination" == /* ]] || { error '快照 ID 或恢复路径无效。'; return 1; }
   confirm_action "确认将快照 ${snapshot_id} 恢复到 ${destination}？" || { info '已取消。'; return 0; }
@@ -588,7 +592,7 @@ draw_menu() {
   printf '  3. 配置 Cloudflare R2 仓库\n'
   printf '  4. 创建快照备份\n'
   printf '  5. 查看快照列表\n'
-  printf '  6. 恢复快照\n'
+  printf '  6. 查询快照并恢复\n'
   printf '  7. Web UI 启用、停止与状态\n'
   printf '  8. 查看仓库状态\n'
   printf '  9. 查看 Web UI 日志\n'
