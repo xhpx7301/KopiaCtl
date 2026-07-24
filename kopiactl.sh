@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.12"
+readonly MANAGER_VERSION="1.0.13"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -719,7 +719,7 @@ uninstall_menu() {
   printf '\n%s请选择卸载内容%s\n' "$BOLD" "$RESET"
   printf '  1. 卸载 Kopia（保留配置、仓库和 KopiaCtl）\n'
   printf '  2. 卸载 KopiaCtl 管理菜单（保留 Kopia 与配置）\n'
-  printf '  3. 完全卸载 Kopia 和 KopiaCtl（删除本地配置和备份）\n'
+  printf '  3. 完全卸载 Kopia 和 KopiaCtl（删除本地配置和备份，不删除远端 R2 快照）\n'
   printf '  0. 返回\n'
   read -r -p '请选择 [0-3]：' choice
   case "$choice" in
