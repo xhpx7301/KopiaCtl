@@ -46,7 +46,7 @@ kopiactl
 
 建议的首次操作顺序：选择安装方式（小型服务器选原生安装）→ 配置 Cloudflare R2 仓库 → 创建首个快照。Web UI 仅在确有浏览器管理需求时从菜单启用。
 
-R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Access Key。KopiaCtl 自动使用 `<Account ID>.r2.cloudflarestorage.com` 作为 S3 endpoint，使用 `region=auto`。连接已有仓库时还需要输入该 Kopia 仓库的加密密码；它不是 R2 Secret Access Key。创建新仓库时，菜单会要求设置并确认这个密码。
+R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Access Key。KopiaCtl 自动使用 `<Account ID>.r2.cloudflarestorage.com` 作为 S3 endpoint，使用 `region=auto`。连接已有仓库时还需要输入该 Kopia 仓库的加密密码；它不是 R2 Secret Access Key。创建新仓库时，菜单会要求设置并确认这个密码。仓库密码仅保留在当前菜单进程的内存中，因此一次输入后可用于本次会话内的快照、恢复和仓库状态操作；退出菜单即清除。
 
 ## 文件位置
 

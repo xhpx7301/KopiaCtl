@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.1"
+readonly MANAGER_VERSION="1.0.2"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -18,6 +18,9 @@ readonly MANAGER_COMMAND="/usr/local/bin/kopiactl"
 readonly SERVICE_FILE="/etc/systemd/system/kopia-web-ui.service"
 readonly KOPIA_IMAGE="kopia/kopia:latest"
 readonly DEFAULT_WEB_UI_PORT="51515"
+
+# Only retained for the lifetime of the interactive menu process.
+REPOSITORY_PASSWORD=''
 
 if [[ -t 1 ]]; then
   readonly RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m' BLUE=$'\033[34m' BOLD=$'\033[1m' RESET=$'\033[0m'
@@ -286,6 +289,22 @@ run_kopia_with_repository_password() {
   KOPIA_PASSWORD="$repository_password" run_kopia "$@"
 }
 
+ensure_repository_password() {
+  [[ -n "$REPOSITORY_PASSWORD" ]] && return 0
+  read -r -s -p '请输入 Kopia 仓库密码（不是 R2 Secret Access Key，输入不回显）：' REPOSITORY_PASSWORD
+  printf '\n'
+  [[ -n "$REPOSITORY_PASSWORD" ]] || { error 'Kopia 仓库密码不能为空。'; return 1; }
+}
+
+run_kopia_authenticated() {
+  ensure_repository_password || return 1
+  if ! run_kopia_with_repository_password "$REPOSITORY_PASSWORD" "$@"; then
+    REPOSITORY_PASSWORD=''
+    error '无法打开 Kopia 仓库。请检查仓库密码后重试。'
+    return 1
+  fi
+}
+
 configure_r2_repository() {
   local action account_id bucket access_key secret_key endpoint repository_password password_confirm
   printf '\n%sCloudflare R2 仓库配置%s\n' "$BOLD" "$RESET"
@@ -315,27 +334,33 @@ configure_r2_repository() {
     info '正在验证仓库密码并连接 Cloudflare R2...'
     run_kopia_with_repository_password "$repository_password" repository connect s3 --bucket="$bucket" --endpoint="$endpoint" --region=auto --access-key="$access_key" --secret-access-key="$secret_key" || return 1
   fi
-  success "Cloudflare R2 仓库已配置：${bucket}。R2 密钥已由 Kopia 加密保存。"
+  REPOSITORY_PASSWORD="$repository_password"
+  success "Cloudflare R2 仓库已配置：${bucket}。R2 密钥已由 Kopia 加密保存；本次菜单会话无需再次输入仓库密码。"
 }
 
 create_snapshot() {
   local path mode
   read -r -p '请输入要备份的绝对路径：' path
   [[ "$path" == /* && -e "$path" ]] || { error '请输入存在的 Linux 绝对路径。'; return 1; }
+  ensure_repository_password || return 1
   mode="$(current_mode)"
   if [[ "$mode" == docker ]]; then
     require_docker || return 1
-    docker run --rm \
+    if ! KOPIA_PASSWORD="$REPOSITORY_PASSWORD" docker run --rm -e KOPIA_PASSWORD \
       -v "$(dirname "$KOPIA_CONFIG_FILE"):/app/config" \
       -v "$CACHE_DIR:/app/cache" \
       -v "${path}:${path}:ro" \
-      "$KOPIA_IMAGE" --config-file=/app/config/repository.config snapshot create "$path"
+      "$KOPIA_IMAGE" --config-file=/app/config/repository.config snapshot create "$path"; then
+      REPOSITORY_PASSWORD=''
+      error '无法创建快照。若提示无法打开仓库，请检查仓库密码后重试。'
+      return 1
+    fi
   else
-    native_kopia snapshot create "$path"
+    run_kopia_authenticated snapshot create "$path"
   fi
 }
 
-list_snapshots() { run_kopia snapshot list; }
+list_snapshots() { run_kopia_authenticated snapshot list; }
 
 restore_snapshot() {
   local snapshot_id destination mode
@@ -344,16 +369,21 @@ restore_snapshot() {
   [[ "$snapshot_id" =~ ^[A-Za-z0-9._:-]+$ && "$destination" == /* ]] || { error '快照 ID 或恢复路径无效。'; return 1; }
   confirm_action "确认将快照 ${snapshot_id} 恢复到 ${destination}？" || { info '已取消。'; return 0; }
   install -d -m 0750 "$destination" || return 1
+  ensure_repository_password || return 1
   mode="$(current_mode)"
   if [[ "$mode" == docker ]]; then
     require_docker || return 1
-    docker run --rm \
+    if ! KOPIA_PASSWORD="$REPOSITORY_PASSWORD" docker run --rm -e KOPIA_PASSWORD \
       -v "$(dirname "$KOPIA_CONFIG_FILE"):/app/config" \
       -v "$CACHE_DIR:/app/cache" \
       -v "${destination}:${destination}" \
-      "$KOPIA_IMAGE" --config-file=/app/config/repository.config snapshot restore "$snapshot_id" "$destination"
+      "$KOPIA_IMAGE" --config-file=/app/config/repository.config snapshot restore "$snapshot_id" "$destination"; then
+      REPOSITORY_PASSWORD=''
+      error '无法恢复快照。若提示无法打开仓库，请检查仓库密码后重试。'
+      return 1
+    fi
   else
-    native_kopia snapshot restore "$snapshot_id" "$destination"
+    run_kopia_authenticated snapshot restore "$snapshot_id" "$destination"
   fi
 }
 
@@ -492,7 +522,7 @@ show_status() {
   printf '仓库：%s\n' "$repository_state"
 }
 
-show_repository_status() { run_kopia repository status; }
+show_repository_status() { run_kopia_authenticated repository status; }
 
 backup_local_config() {
   local archive item
