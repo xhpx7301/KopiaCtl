@@ -10,7 +10,7 @@
 | Cloudflare R2 | 引导连接已有仓库，或在空 R2 Bucket 中创建新仓库。R2 密钥由 Kopia 的仓库配置保存，不写入 KopiaCtl 菜单配置。 |
 | 快照与恢复 | 交互式创建快照、列出快照；恢复前会自动显示可恢复快照列表，再输入要恢复的快照 ID。Docker 模式会临时只读挂载备份路径。 |
 | Web UI | 默认关闭；可单独启用、启动、停止、查看或修改登录凭据。原生模式使用 systemd，Docker 模式使用 Compose profile。 |
-| 日常维护 | 查看状态、仓库状态和日志，备份本地配置，更新或卸载管理器。 |
+| 日常维护 | 查看状态、仓库状态和日志，备份本地配置；可分别卸载 Kopia、KopiaCtl 或两者。 |
 
 ## 支持环境
 
@@ -60,6 +60,10 @@ R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Acc
 | 菜单命令 | `/usr/local/bin/kopiactl` |
 
 本地 `repository.config` 是连接远端仓库所必需的敏感文件。应将 `/opt/kopiactl/` 纳入另一套服务器备份，但不要把它公开上传。完全卸载只清理本机数据，不会删除 R2 中的任何快照或对象。
+
+## 卸载
+
+菜单提供三种范围：仅卸载 Kopia（保留配置和 KopiaCtl）、仅卸载 KopiaCtl 管理入口（保留 Kopia 和配置），或完全卸载 Kopia 与 KopiaCtl。本地完全卸载会删除 `/opt/kopiactl/` 和 `/var/backups/kopiactl/`，但不会删除 Cloudflare R2 中的仓库或快照。Docker 模式仅删除 Kopia 容器和镜像，不会卸载 Docker Engine。
 
 ## Web UI 安全
 

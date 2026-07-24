@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.10"
+readonly MANAGER_VERSION="1.0.11"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -649,29 +649,83 @@ backup_local_config() {
   success "本地配置备份完成：${archive}"
 }
 
+remove_kopia_runtime() {
+  case "$(current_mode)" in
+    native)
+      if ! command -v kopia >/dev/null 2>&1; then
+        warn '原生 Kopia 当前未安装。'
+        return 0
+      fi
+      stop_web_ui
+      rm -f "$SERVICE_FILE"
+      systemctl daemon-reload
+      if command -v dpkg-query >/dev/null 2>&1 \
+          && [[ "$(dpkg-query -W -f='${db:Status-Status}' kopia 2>/dev/null || true)" == installed ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y kopia || { error 'Kopia 软件包卸载失败。'; return 1; }
+      else
+        error '未检测到由 APT 安装的 Kopia；为避免误删手动安装的二进制，未执行删除。'
+        return 1
+      fi
+      ;;
+    docker)
+      stop_web_ui
+      if command -v docker >/dev/null 2>&1; then
+        docker rm -f kopia-web-ui 2>/dev/null || true
+        docker image rm "$KOPIA_IMAGE" 2>/dev/null || true
+      else
+        warn 'Docker 当前未安装；没有可移除的 Kopia 容器或镜像。'
+      fi
+      ;;
+  esac
+}
+
+uninstall_kopia() {
+  local mode
+  mode="$(current_mode)"
+  warn "将卸载 $(localize_mode "$mode") 的 Kopia 运行时，但保留 /opt/kopiactl 中的仓库配置和 KopiaCtl。"
+  warn 'Cloudflare R2 中的仓库与快照不会被删除。'
+  confirm_action '确认卸载 Kopia？' || { info '已取消。'; return 0; }
+  remove_kopia_runtime || return 1
+  success 'Kopia 已卸载；仓库配置与 KopiaCtl 管理菜单仍保留。'
+}
+
+remove_manager_files() {
+  rm -f "$MANAGER_COMMAND" "$MANAGER_SCRIPT"
+  rmdir "$MANAGER_DIR" 2>/dev/null || true
+}
+
+uninstall_manager() {
+  warn '这将删除 kopiactl 命令和管理脚本，但不会修改 Kopia、仓库配置或远端快照。'
+  confirm_action '确认卸载 KopiaCtl 管理菜单？' || { info '已取消。'; return 0; }
+  remove_manager_files
+  success 'KopiaCtl 管理菜单已卸载；Kopia 与仓库配置保持不变。'
+}
+
+uninstall_everything() {
+  warn '这将卸载 Kopia 与 KopiaCtl，并停止 Web UI。'
+  warn "这还将永久删除 ${INSTALL_DIR} 与 ${BACKUP_DIR} 中的本地配置、缓存和备份。"
+  warn 'Cloudflare R2 中的仓库与快照不会被删除。'
+  confirm_action '确认完全卸载 Kopia 和 KopiaCtl？此操作不可恢复。' || { info '已取消。'; return 0; }
+  remove_kopia_runtime || return 1
+  rm -f /etc/apt/sources.list.d/kopia.list /usr/share/keyrings/kopia-keyring.gpg "$SERVICE_FILE"
+  systemctl daemon-reload
+  remove_manager_files
+  rm -rf -- "$INSTALL_DIR" "$BACKUP_DIR"
+  success 'Kopia、KopiaCtl、本地配置和备份均已删除；R2 远端快照未受影响。'
+}
+
 uninstall_menu() {
   local choice
-  printf '\n  1. 删除 KopiaCtl 管理入口（保留 Kopia 与配置）\n'
-  printf '  2. 完全卸载 KopiaCtl 与本地配置（不删除远端 R2 快照）\n'
+  printf '\n%s请选择卸载内容%s\n' "$BOLD" "$RESET"
+  printf '  1. 卸载 Kopia（保留配置、仓库和 KopiaCtl）\n'
+  printf '  2. 卸载 KopiaCtl 管理菜单（保留 Kopia 与配置）\n'
+  printf '  3. 完全卸载 Kopia 和 KopiaCtl（删除本地配置和备份）\n'
   printf '  0. 返回\n'
-  read -r -p '请选择 [0-2]：' choice
+  read -r -p '请选择 [0-3]：' choice
   case "$choice" in
-    1)
-      confirm_action '确认删除 kopiactl 管理入口？' || return 0
-      rm -f "$MANAGER_COMMAND" "$MANAGER_SCRIPT"
-      rmdir "$MANAGER_DIR" 2>/dev/null || true
-      success 'KopiaCtl 管理入口已删除。'
-      ;;
-    2)
-      warn '此操作会删除本地 Kopia 配置、缓存、Compose 配置和 KopiaCtl 备份；不会删除 R2 仓库中的快照。'
-      confirm_action '确认完全卸载本地 KopiaCtl 数据？此操作不可恢复。' || { info '已取消。'; return 0; }
-      stop_web_ui
-      rm -f "$SERVICE_FILE" "$MANAGER_COMMAND" "$MANAGER_SCRIPT"
-      systemctl daemon-reload
-      rm -rf -- "$INSTALL_DIR" "$BACKUP_DIR"
-      rmdir "$MANAGER_DIR" 2>/dev/null || true
-      success 'KopiaCtl 本地数据已删除；R2 远端仓库未受影响。'
-      ;;
+    1) uninstall_kopia ;;
+    2) uninstall_manager ;;
+    3) uninstall_everything ;;
     0) return 0 ;;
     *) error '无效选项。'; return 1 ;;
   esac
@@ -748,18 +802,19 @@ draw_menu() {
   printf '%s============================================%s\n' "$BLUE" "$RESET"
   status_line
   printf '%s--------------------------------------------%s\n' "$BLUE" "$RESET"
-  printf '  1. 查看运行状态\n'
-  printf '  2. 选择安装方式（原生 / Docker）\n'
-  printf '  3. 配置 Cloudflare R2 仓库\n'
-  printf '  4. 创建快照备份\n'
-  printf '  5. 查看快照列表\n'
-  printf '  6. 查询快照并恢复\n'
-  printf '  7. Web UI 管理\n'
-  printf '  8. 查看仓库状态\n'
-  printf '  9. 查看 Web UI 日志\n'
-  printf ' 10. 备份本地 Kopia 配置\n'
-  printf ' 11. 更新 KopiaCtl 管理菜单\n'
-  printf ' 12. 卸载选项\n'
+  printf '  1. 更新 KopiaCtl 管理菜单\n'
+  printf '  2. 查看运行状态\n'
+  printf '  3. 选择安装方式（原生 / Docker）\n'
+  printf '  4. 配置 Cloudflare R2 仓库\n'
+  printf '  5. 查看仓库状态\n'
+  printf '  6. 创建快照备份\n'
+  printf '  7. 查看快照列表\n'
+  printf '  8. 查询快照并恢复\n'
+  printf '  9. Web UI 管理\n'
+  printf ' 10. 查看 Web UI 日志\n'
+  printf '\n'
+  printf ' 11. 备份本地 Kopia 配置\n'
+  printf ' 12. 卸载 Kopia 或 KopiaCtl\n'
   printf '  0. 退出\n'
   printf '%s============================================%s\n' "$BLUE" "$RESET"
   printf '提示：默认原生安装、Cloudflare R2 仓库、Web UI 关闭。\n'
@@ -774,21 +829,21 @@ main_menu() {
     read -r -p '请选择 [0-12]：' choice || exit 0
     printf '\n'
     case "$choice" in
-      1) show_status; pause_menu ;;
-      2) choose_install_mode; pause_menu ;;
-      3) configure_r2_repository; pause_menu ;;
-      4) create_snapshot; pause_menu ;;
-      5) list_snapshots; pause_menu ;;
-      6) restore_snapshot; pause_menu ;;
-      7) web_ui_menu ;;
-      8) show_repository_status; pause_menu ;;
-      9) show_logs; pause_menu ;;
-      10) backup_local_config; pause_menu ;;
-      11)
+      1)
         update_manager
         pause_menu
         [[ "$MANAGER_UPDATED" != true ]] || exec "$MANAGER_SCRIPT"
         ;;
+      2) show_status; pause_menu ;;
+      3) choose_install_mode; pause_menu ;;
+      4) configure_r2_repository; pause_menu ;;
+      5) show_repository_status; pause_menu ;;
+      6) create_snapshot; pause_menu ;;
+      7) list_snapshots; pause_menu ;;
+      8) restore_snapshot; pause_menu ;;
+      9) web_ui_menu ;;
+      10) show_logs; pause_menu ;;
+      11) backup_local_config; pause_menu ;;
       12) uninstall_menu; pause_menu ;;
       0) exit 0 ;;
       *) warn '无效选项。'; pause_menu ;;
