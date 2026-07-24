@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.4"
+readonly MANAGER_VERSION="1.0.5"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -598,20 +598,18 @@ backup_local_config() {
 
 uninstall_menu() {
   local choice
-  printf '\n  1. 停止 Web UI（保留 Kopia、仓库配置与快照）\n'
-  printf '  2. 删除 KopiaCtl 管理入口（保留 Kopia 与配置）\n'
-  printf '  3. 完全卸载 KopiaCtl 与本地配置（不删除远端 R2 快照）\n'
+  printf '\n  1. 删除 KopiaCtl 管理入口（保留 Kopia 与配置）\n'
+  printf '  2. 完全卸载 KopiaCtl 与本地配置（不删除远端 R2 快照）\n'
   printf '  0. 返回\n'
-  read -r -p '请选择 [0-3]：' choice
+  read -r -p '请选择 [0-2]：' choice
   case "$choice" in
-    1) stop_web_ui ;;
-    2)
+    1)
       confirm_action '确认删除 kopiactl 管理入口？' || return 0
       rm -f "$MANAGER_COMMAND" "$MANAGER_SCRIPT"
       rmdir "$MANAGER_DIR" 2>/dev/null || true
       success 'KopiaCtl 管理入口已删除。'
       ;;
-    3)
+    2)
       warn '此操作会删除本地 Kopia 配置、缓存、Compose 配置和 KopiaCtl 备份；不会删除 R2 仓库中的快照。'
       confirm_action '确认完全卸载本地 KopiaCtl 数据？此操作不可恢复。' || { info '已取消。'; return 0; }
       stop_web_ui
