@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.18"
+readonly MANAGER_VERSION="1.0.19"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -92,6 +92,14 @@ config_value() { [[ -f "$CONFIG_FILE" ]] && sed -n "s/^$1=//p" "$CONFIG_FILE" | 
 current_mode() { local mode; mode="$(config_value INSTALL_MODE)"; [[ "$mode" == docker ]] && printf 'docker\n' || printf 'native\n'; }
 web_ui_enabled() { [[ "$(config_value WEB_UI_ENABLED)" == true ]]; }
 web_ui_port() { local port; port="$(config_value WEB_UI_PORT)"; printf '%s\n' "${port:-$DEFAULT_WEB_UI_PORT}"; }
+web_ui_bind_address() {
+  local address
+  address="$(config_value WEB_UI_BIND_ADDRESS)"
+  case "$address" in
+    0.0.0.0|127.0.0.1) printf '%s\n' "$address" ;;
+    *) printf '0.0.0.0\n' ;;
+  esac
+}
 web_ui_user() {
   local user password
   user="$(config_value WEB_UI_USERNAME)"
@@ -126,12 +134,14 @@ localize_service_state() {
 }
 
 write_config() {
-  local mode="$1" enabled="${2:-false}" user="${3:-pingzi}" password="${4:-}" port="${5:-$DEFAULT_WEB_UI_PORT}" repository_password_entry
+  local mode="$1" enabled="${2:-false}" user="${3:-pingzi}" password="${4:-}" port="${5:-$DEFAULT_WEB_UI_PORT}" repository_password_entry bind_address
   if (( $# >= 6 )); then
     repository_password_entry="$6"
   else
     repository_password_entry="$(config_value KOPIA_REPOSITORY_PASSWORD)"
   fi
+  bind_address="${7:-$(web_ui_bind_address)}"
+  [[ "$bind_address" == 0.0.0.0 || "$bind_address" == 127.0.0.1 ]] || bind_address=0.0.0.0
   install -d -m 0750 "$INSTALL_DIR" "$(dirname "$KOPIA_CONFIG_FILE")" "$CACHE_DIR"
   cat >"$CONFIG_FILE" <<EOF
 # 由 KopiaCtl 管理。R2 密钥仅保存在 Kopia 的 repository.config 中。
@@ -140,6 +150,7 @@ WEB_UI_ENABLED=${enabled}
 WEB_UI_USERNAME=${user}
 WEB_UI_PASSWORD=${password}
 WEB_UI_PORT=${port}
+WEB_UI_BIND_ADDRESS=${bind_address}
 KOPIA_REPOSITORY_PASSWORD=${repository_password_entry}
 EOF
   chmod 0600 "$CONFIG_FILE"
@@ -259,7 +270,7 @@ services:
     restart: unless-stopped
     profiles: ["web"]
     ports:
-      - "\${WEB_UI_PORT}:\${WEB_UI_PORT}"
+      - "\${WEB_UI_BIND_ADDRESS}:\${WEB_UI_PORT}:\${WEB_UI_PORT}"
     command:
       - server
       - start
@@ -439,7 +450,7 @@ configure_r2_repository() {
     info '正在将新的仓库密码应用到 Docker Web UI...'
     save_docker_web_ui_repository_password || return 1
     write_compose_file
-    (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d --force-recreate) || { error 'Web UI 容器重建失败。'; return 1; }
+    recreate_docker_web_ui || { error 'Web UI 容器重建失败。'; return 1; }
     success 'Docker Web UI 已连接到新的仓库配置。'
   fi
 }
@@ -498,11 +509,12 @@ restore_snapshot() {
 }
 
 write_native_service() {
-  local binary password port user service_password service_user
+  local binary password port user bind_address service_password service_user
   binary="$(command -v kopia)" || { error '未安装原生 Kopia。'; return 1; }
   password="$(config_value WEB_UI_PASSWORD)"
   port="$(web_ui_port)"
   user="$(web_ui_user)"
+  bind_address="$(web_ui_bind_address)"
   [[ -n "$password" ]] || { error 'Web UI 密码未设置。'; return 1; }
   service_password="${password//%/%%}"
   service_user="${user//%/%%}"
@@ -515,7 +527,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=KOPIA_CONFIG_PATH=${KOPIA_CONFIG_FILE}
-ExecStart=${binary} server start --insecure --address=0.0.0.0:${port} --server-username=${service_user} --server-password=${service_password} --config-file=${KOPIA_CONFIG_FILE}
+ExecStart=${binary} server start --insecure --address=${bind_address}:${port} --server-username=${service_user} --server-password=${service_password} --config-file=${KOPIA_CONFIG_FILE}
 Restart=on-failure
 RestartSec=5
 
@@ -547,6 +559,28 @@ save_docker_web_ui_repository_password() {
   enabled="$(web_ui_enabled && printf true || printf false)"
   write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$password_entry"
   success 'Docker Web UI 的仓库密码已保存，并将仅以 KOPIA_PASSWORD 注入容器。'
+}
+
+recreate_docker_web_ui() {
+  local project_name network network_project
+  local -a external_networks=()
+  project_name="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' kopia-web-ui 2>/dev/null || true)"
+  while IFS= read -r network; do
+    [[ -n "$network" ]] || continue
+    network_project="$(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}' "$network" 2>/dev/null || true)"
+    [[ -n "$project_name" && "$network_project" == "$project_name" ]] || external_networks+=("$network")
+  done < <(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' kopia-web-ui 2>/dev/null || true)
+
+  (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d --force-recreate) || return 1
+  for network in "${external_networks[@]}"; do
+    if docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' kopia-web-ui 2>/dev/null | grep -Fxq "$network"; then
+      continue
+    fi
+    docker network connect "$network" kopia-web-ui 2>/dev/null || {
+      error "容器已重建，但无法重新连接外部网络 ${network}。请检查该网络后重试。"
+      return 1
+    }
+  done
 }
 
 generate_web_ui_password() {
@@ -620,7 +654,11 @@ start_web_ui() {
       (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d) || { error 'Web UI 容器启动失败。'; return 1; }
       ;;
   esac
-  success "Kopia Web UI 已启动：http://服务器IP:$(web_ui_port)"
+  if [[ "$(web_ui_bind_address)" == 127.0.0.1 ]]; then
+    success "Kopia Web UI 已启动，仅监听宿主机 127.0.0.1:$(web_ui_port)。"
+  else
+    success "Kopia Web UI 已启动：http://服务器IP:$(web_ui_port)"
+  fi
 }
 
 stop_web_ui() {
@@ -646,8 +684,9 @@ web_ui_menu() {
   printf '  4. 查看 Web UI 登录凭据\n'
   printf '  5. 修改 Web UI 登录凭据\n'
   printf '  6. 更新 Docker Web UI 仓库密码\n'
+  printf '  7. 修改 Web UI 发布范围\n'
   printf '  0. 返回\n'
-  read -r -p '请选择 [0-6，直接回车返回]：' selected
+  read -r -p '请选择 [0-7，直接回车返回]：' selected
   case "$selected" in
     ''|0) return 0 ;;
     1) start_web_ui ;;
@@ -656,6 +695,7 @@ web_ui_menu() {
     4) show_web_ui_credentials ;;
     5) modify_web_ui_credentials ;;
     6) update_docker_web_ui_repository_password ;;
+    7) configure_web_ui_publish_scope ;;
     *) error '无效选项。'; pause_menu; return 1 ;;
   esac
   pause_menu
@@ -669,7 +709,7 @@ update_docker_web_ui_repository_password() {
   if web_ui_enabled; then
     require_docker || return 1
     write_compose_file
-    (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d --force-recreate) || { error 'Web UI 容器重建失败。'; return 1; }
+    recreate_docker_web_ui || { error 'Web UI 容器重建失败。'; return 1; }
     success 'Docker Web UI 已使用新的仓库密码重建。'
   fi
 }
@@ -680,7 +720,12 @@ show_web_ui_credentials() {
   password="$(config_value WEB_UI_PASSWORD)"
   [[ -n "$password" ]] || { warn '尚未设置 Web UI 登录凭据。请先选择“启用并启动 Web UI”。'; return 0; }
   printf '\n%sWeb UI 登录凭据%s\n' "$BOLD" "$RESET"
-  printf '登录地址：http://服务器IP:%s\n用户名：%s\n密码：已设置（默认不显示）\n' "$(web_ui_port)" "$(web_ui_user)"
+  if [[ "$(web_ui_bind_address)" == 127.0.0.1 ]]; then
+    printf '本机地址：http://127.0.0.1:%s\n远程访问：请使用反向代理\n' "$(web_ui_port)"
+  else
+    printf '登录地址：http://服务器IP:%s\n' "$(web_ui_port)"
+  fi
+  printf '用户名：%s\n密码：已设置（默认不显示）\n' "$(web_ui_user)"
   confirm_action '确认在当前终端显示明文密码？' || return 0
   printf '用户名：%s\n密码：%s\n' "$(web_ui_user)" "$password"
 }
@@ -705,12 +750,55 @@ modify_web_ui_credentials() {
       docker)
         require_docker || return 1
         write_compose_file
-        (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d --force-recreate) || { error 'Web UI 容器重建失败。'; return 1; }
+        recreate_docker_web_ui || { error 'Web UI 容器重建失败。'; return 1; }
         ;;
     esac
     success 'Web UI 登录凭据已修改并生效。'
   else
     success 'Web UI 登录凭据已保存；Web UI 仍保持未启用。'
+  fi
+}
+
+configure_web_ui_publish_scope() {
+  local selected bind_address enabled
+  ensure_config
+  printf '\nWeb UI 发布范围（当前：%s）\n' "$(web_ui_bind_address)"
+  printf '  1. 仅宿主机：127.0.0.1（推荐与反向代理或共享 Docker 网络配合）\n'
+  printf '  2. 所有 IPv4 接口：0.0.0.0（可直接从公网访问）\n'
+  read -r -p '请选择 [1-2，直接回车取消]：' selected
+  case "$selected" in
+    1) bind_address=127.0.0.1 ;;
+    2) bind_address=0.0.0.0 ;;
+    '') return 0 ;;
+    *) error '无效选项。'; return 1 ;;
+  esac
+
+  enabled="$(web_ui_enabled && printf true || printf false)"
+  write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$(config_value KOPIA_REPOSITORY_PASSWORD)" "$bind_address"
+  if [[ "$enabled" != true ]]; then
+    success "Web UI 发布范围已保存为 ${bind_address}；将在下次启用时生效。"
+    return 0
+  fi
+
+  info '正在应用新的 Web UI 发布范围...'
+  case "$(current_mode)" in
+    native)
+      write_native_service || return 1
+      if systemctl is-active --quiet kopia-web-ui.service; then
+        systemctl restart kopia-web-ui.service || { error 'Web UI 重启失败。'; return 1; }
+      else
+        systemctl enable --now kopia-web-ui.service || { error 'Web UI 启动失败。'; return 1; }
+      fi
+      ;;
+    docker)
+      require_docker || return 1
+      write_compose_file
+      recreate_docker_web_ui || { error 'Web UI 容器重建失败。'; return 1; }
+      ;;
+  esac
+  success "Web UI 发布范围已改为 ${bind_address}。"
+  if [[ "$(current_mode)" == docker && "$bind_address" == 127.0.0.1 ]]; then
+    info 'NPM 可继续通过共享 Docker 网络访问 kopia-web-ui:51515；不要在 NPM 中填写 127.0.0.1。'
   fi
 }
 
@@ -720,8 +808,13 @@ show_web_ui_status() {
   case "$(current_mode)" in
     native)
       state="$(systemctl is-active kopia-web-ui.service 2>/dev/null || true)"
-      printf 'Web UI：%s\n服务监听：0.0.0.0:%s\n浏览器访问：http://服务器IP:%s\n' \
-        "$(localize_service_state "$state")" "$(web_ui_port)" "$(web_ui_port)"
+      printf 'Web UI：%s\n服务监听：%s:%s\n' \
+        "$(localize_service_state "$state")" "$(web_ui_bind_address)" "$(web_ui_port)"
+      if [[ "$(web_ui_bind_address)" == 127.0.0.1 ]]; then
+        printf '本机访问：http://127.0.0.1:%s（远程访问请使用反向代理）\n' "$(web_ui_port)"
+      else
+        printf '浏览器访问：http://服务器IP:%s\n' "$(web_ui_port)"
+      fi
       if [[ "$state" == failed ]]; then
         error '错误点请查看下方 systemd 日志，重点关注启动命令、端口占用和仓库配置报错。'
         journalctl -u kopia-web-ui.service -n 60 --no-pager 2>&1 || true
