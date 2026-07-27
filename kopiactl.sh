@@ -876,9 +876,13 @@ backup_schedule_menu() {
   while true; do
     printf '\n%s自动备份管理%s\n' "$BOLD" "$RESET"
     printf '  1. 为文件夹设置或切换自动备份模式\n'
+    printf '     新建或更新 KopiaCtl 管理记录，并立即设置对应的 Kopia Policy 或 systemd timer。\n'
     printf '  2. 查看 KopiaCtl 管理的自动备份\n'
+    printf '     仅读取 KopiaCtl 管理记录；不会修改 Kopia Policy 或 systemd timer。\n'
     printf '  3. 同步全部已管理自动备份策略\n'
+    printf '     以 KopiaCtl 管理记录为准，批量覆盖并重建对应的 Kopia Policy 或 systemd timer。\n'
     printf '  4. 停用文件夹自动备份\n'
+    printf '     删除 KopiaCtl 管理记录，并停用对应的 Kopia Policy 或 systemd timer。\n'
     printf '  0. 返回\n'
     read -r -p '请选择 [0-4]：' selected
     case "$selected" in
