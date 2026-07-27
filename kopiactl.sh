@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.21"
+readonly MANAGER_VERSION="1.0.22"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -66,7 +66,7 @@ read_secret_with_length() {
 show_command_usage() {
   cat <<'USAGE'
 KopiaCtl 是 Kopia 的交互式原生 / Docker 管理菜单。
-用法：kopiactl [--install-manager] [--help] [web-ui set-bind <127.0.0.1|0.0.0.0>]
+用法：kopiactl [--install-manager] [--help] [web-ui set-bind <IPv4地址>]
   --install-manager      安装 kopiactl 命令入口，供安装器调用
   --help, -h             显示本帮助
   web-ui set-bind <地址>  设置 Web UI 宿主机发布地址，供其他管理器调用
@@ -93,13 +93,29 @@ config_value() { [[ -f "$CONFIG_FILE" ]] && sed -n "s/^$1=//p" "$CONFIG_FILE" | 
 current_mode() { local mode; mode="$(config_value INSTALL_MODE)"; [[ "$mode" == docker ]] && printf 'docker\n' || printf 'native\n'; }
 web_ui_enabled() { [[ "$(config_value WEB_UI_ENABLED)" == true ]]; }
 web_ui_port() { local port; port="$(config_value WEB_UI_PORT)"; printf '%s\n' "${port:-$DEFAULT_WEB_UI_PORT}"; }
+is_valid_ipv4() {
+  local address="$1" octet
+  [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS='.' read -r -a octet <<< "$address"
+  for address in "${octet[@]}"; do
+    (( 10#$address <= 255 )) || return 1
+  done
+}
+is_local_ipv4_address() {
+  local address="$1"
+  command -v ip >/dev/null 2>&1 || return 1
+  ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$address"
+}
+is_web_ui_bind_address() {
+  case "$1" in
+    0.0.0.0|127.0.0.1) return 0 ;;
+    *) is_valid_ipv4 "$1" && is_local_ipv4_address "$1" ;;
+  esac
+}
 web_ui_bind_address() {
   local address
   address="$(config_value WEB_UI_BIND_ADDRESS)"
-  case "$address" in
-    0.0.0.0|127.0.0.1) printf '%s\n' "$address" ;;
-    *) printf '0.0.0.0\n' ;;
-  esac
+  is_web_ui_bind_address "$address" && printf '%s\n' "$address" || printf '0.0.0.0\n'
 }
 web_ui_user() {
   local user password
@@ -148,7 +164,7 @@ write_config() {
     repository_password_b64="$(config_value KOPIA_REPOSITORY_PASSWORD_B64)"
   fi
   bind_address="${7:-$(web_ui_bind_address)}"
-  [[ "$bind_address" == 0.0.0.0 || "$bind_address" == 127.0.0.1 ]] || bind_address=0.0.0.0
+  is_web_ui_bind_address "$bind_address" || bind_address=0.0.0.0
   install -d -m 0750 "$INSTALL_DIR" "$(dirname "$KOPIA_CONFIG_FILE")" "$CACHE_DIR"
   cat >"$CONFIG_FILE" <<EOF
 # 由 KopiaCtl 管理。R2 密钥仅保存在 Kopia 的 repository.config 中。
@@ -629,6 +645,91 @@ recreate_docker_web_ui() {
   done
 }
 
+is_npm_container() {
+  local image="${1,,}" container_name="${2,,}"
+  case "$image" in *nginx*proxy*manager*|jc21/*) return 0 ;; esac
+  case "$container_name" in npm|npm-*|nginx-proxy-manager|nginx-proxy-manager-*) return 0 ;; esac
+  return 1
+}
+
+docker_gateway_targets_for_container() {
+  local container_reference="$1" container_id container_name network gateway
+  IFS='|' read -r container_id container_name < <(docker inspect --format '{{.Id}}|{{.Name}}' "$container_reference" 2>/dev/null)
+  [[ -n "$container_id" && -n "$container_name" ]] || return 0
+  container_name="${container_name#/}"
+  while IFS='|' read -r network gateway; do
+    is_valid_ipv4 "$gateway" || continue
+    printf '%s\t%s\t%s\t%s\n' "$container_id" "$container_name" "$network" "$gateway"
+  done < <(docker inspect --format '{{range $name, $network := .NetworkSettings.Networks}}{{$name}}|{{$network.Gateway}}{{println}}{{end}}' "$container_reference" 2>/dev/null)
+}
+
+find_npm_gateway_targets() {
+  local container_id image container_name
+  require_docker || return 0
+  while IFS='|' read -r container_id image container_name; do
+    is_npm_container "$image" "$container_name" || continue
+    docker_gateway_targets_for_container "$container_id"
+  done < <(docker ps --format '{{.ID}}|{{.Image}}|{{.Names}}' 2>/dev/null)
+}
+
+select_npm_gateway_target() {
+  local manual_container target selection i network_mode
+  local -a targets
+  NPM_GATEWAY_CONTAINER_ID=''
+  NPM_GATEWAY_CONTAINER_NAME=''
+  NPM_GATEWAY_NETWORK=''
+  NPM_GATEWAY_ADDRESS=''
+  require_docker || return 1
+  mapfile -t targets < <(find_npm_gateway_targets)
+  if (( ${#targets[@]} == 0 )); then
+    warn '未自动识别到带 IPv4 Docker 网络网关的 Nginx Proxy Manager 容器。'
+    docker ps --format '{{.ID}} | {{.Names}} | {{.Image}}' 2>/dev/null || true
+    read -r -p '输入 NPM 容器名称或 ID（直接回车取消）：' manual_container
+    [[ -n "$manual_container" ]] || return 1
+    mapfile -t targets < <(docker_gateway_targets_for_container "$manual_container")
+    if (( ${#targets[@]} == 0 )); then
+      network_mode="$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$manual_container" 2>/dev/null || true)"
+      [[ "$network_mode" == host ]] && warn '该容器使用 host 网络，请选择“仅宿主机”模式。' || error "容器 ${manual_container} 未找到 IPv4 Docker 网络网关。"
+      return 1
+    fi
+  fi
+  if (( ${#targets[@]} == 1 )); then
+    target="${targets[0]}"
+  else
+    printf '\n检测到多个 NPM Docker 网络：\n'
+    for ((i = 0; i < ${#targets[@]}; i++)); do
+      IFS=$'\t' read -r NPM_GATEWAY_CONTAINER_ID NPM_GATEWAY_CONTAINER_NAME NPM_GATEWAY_NETWORK NPM_GATEWAY_ADDRESS <<< "${targets[$i]}"
+      printf '  %d. 容器 %s，网络 %s，网关 %s\n' "$((i + 1))" "$NPM_GATEWAY_CONTAINER_NAME" "$NPM_GATEWAY_NETWORK" "$NPM_GATEWAY_ADDRESS"
+    done
+    read -r -p "请选择 [1-${#targets[@]}]：" selection
+    [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#targets[@]} )) || { error "无效选项：${selection}"; return 1; }
+    target="${targets[$((selection - 1))]}"
+  fi
+  IFS=$'\t' read -r NPM_GATEWAY_CONTAINER_ID NPM_GATEWAY_CONTAINER_NAME NPM_GATEWAY_NETWORK NPM_GATEWAY_ADDRESS <<< "$target"
+  if ! is_local_ipv4_address "$NPM_GATEWAY_ADDRESS"; then
+    error "Docker 网关 ${NPM_GATEWAY_ADDRESS} 未出现在本机网卡地址中，无法安全作为 Web UI 监听地址。"
+    return 1
+  fi
+  info "检测到 NPM 容器 ${NPM_GATEWAY_CONTAINER_NAME}，网络 ${NPM_GATEWAY_NETWORK}，网关 ${NPM_GATEWAY_ADDRESS}。"
+}
+
+verify_npm_gateway_connection() {
+  local node_check
+  node_check='const net = require("net");
+const socket = net.createConnection({ host: process.argv[1], port: Number(process.argv[2]) });
+socket.setTimeout(5000);
+socket.on("connect", () => { socket.end(); process.exit(0); });
+socket.on("timeout", () => { socket.destroy(); process.exit(1); });
+socket.on("error", () => process.exit(1));'
+  if docker exec "$NPM_GATEWAY_CONTAINER_ID" node -e "$node_check" "$NPM_GATEWAY_ADDRESS" "$(web_ui_port)" >/dev/null 2>&1; then
+    success "NPM 容器 ${NPM_GATEWAY_CONTAINER_NAME} 可连接 Web UI：${NPM_GATEWAY_ADDRESS}:$(web_ui_port)。"
+    info "请在 NPM 中将“转发主机名/IP”设为 ${NPM_GATEWAY_ADDRESS}，端口设为 $(web_ui_port)，协议使用 http。"
+    return 0
+  fi
+  warn "NPM 容器 ${NPM_GATEWAY_CONTAINER_NAME} 无法连接 ${NPM_GATEWAY_ADDRESS}:$(web_ui_port)。请检查服务重启结果、Docker 网络和防火墙。"
+  return 1
+}
+
 generate_web_ui_password() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -hex 16 && return 0
@@ -673,7 +774,7 @@ configure_web_ui_credentials() {
 }
 
 start_web_ui() {
-  local existing_password
+  local existing_password bind_address
   ensure_config
   [[ -f "$KOPIA_CONFIG_FILE" ]] || { error '尚未配置 Kopia 仓库。请先选择“配置 Cloudflare R2 仓库”，再启用 Web UI。'; return 1; }
   if ! web_ui_enabled; then
@@ -686,6 +787,7 @@ start_web_ui() {
       configure_web_ui_credentials true || return 1
     fi
   fi
+  bind_address="$(web_ui_bind_address)"
   case "$(current_mode)" in
     native)
       install_native_kopia || return 1
@@ -701,7 +803,13 @@ start_web_ui() {
       }
       for _ in 1 2 3; do
         if systemctl is-active --quiet kopia-web-ui.service && native_web_ui_port_listening; then
-          success "Kopia Web UI 已启动：http://服务器IP:$(web_ui_port)"
+          if [[ "$bind_address" == 127.0.0.1 ]]; then
+            success "Kopia Web UI 已启动，仅监听宿主机 127.0.0.1:$(web_ui_port)。"
+          elif [[ "$bind_address" == 0.0.0.0 ]]; then
+            success "Kopia Web UI 已启动：http://服务器IP:$(web_ui_port)"
+          else
+            success "Kopia Web UI 已启动，仅监听 Docker 网关 ${bind_address}:$(web_ui_port)。"
+          fi
           return 0
         fi
         sleep 1
@@ -719,10 +827,12 @@ start_web_ui() {
       (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d) || { error 'Web UI 容器启动失败。'; return 1; }
       ;;
   esac
-  if [[ "$(web_ui_bind_address)" == 127.0.0.1 ]]; then
+  if [[ "$bind_address" == 127.0.0.1 ]]; then
     success "Kopia Web UI 已启动，仅监听宿主机 127.0.0.1:$(web_ui_port)。"
-  else
+  elif [[ "$bind_address" == 0.0.0.0 ]]; then
     success "Kopia Web UI 已启动：http://服务器IP:$(web_ui_port)"
+  else
+    success "Kopia Web UI 已启动，仅发布到 Docker 网关 ${bind_address}:$(web_ui_port)。"
   fi
 }
 
@@ -780,15 +890,18 @@ update_docker_web_ui_repository_password() {
 }
 
 show_web_ui_credentials() {
-  local password
+  local password bind_address
   ensure_config
   password="$(config_value WEB_UI_PASSWORD)"
   [[ -n "$password" ]] || { warn '尚未设置 Web UI 登录凭据。请先选择“启用并启动 Web UI”。'; return 0; }
   printf '\n%sWeb UI 登录凭据%s\n' "$BOLD" "$RESET"
-  if [[ "$(web_ui_bind_address)" == 127.0.0.1 ]]; then
+  bind_address="$(web_ui_bind_address)"
+  if [[ "$bind_address" == 127.0.0.1 ]]; then
     printf '本机地址：http://127.0.0.1:%s\n远程访问：请使用反向代理\n' "$(web_ui_port)"
-  else
+  elif [[ "$bind_address" == 0.0.0.0 ]]; then
     printf '登录地址：http://服务器IP:%s\n' "$(web_ui_port)"
+  else
+    printf 'Docker NPM 上游：http://%s:%s\n仅接受该 Docker 网关网络的访问\n' "$bind_address" "$(web_ui_port)"
   fi
   printf '用户名：%s\n密码：已设置（默认不显示）\n' "$(web_ui_user)"
   confirm_action '确认在当前终端显示明文密码？' || return 0
@@ -826,10 +939,7 @@ modify_web_ui_credentials() {
 
 set_web_ui_bind_address() {
   local bind_address="$1" enabled
-  case "$bind_address" in
-    127.0.0.1|0.0.0.0) ;;
-    *) error 'Web UI 发布地址仅支持 127.0.0.1 或 0.0.0.0。'; return 2 ;;
-  esac
+  is_web_ui_bind_address "$bind_address" || { error 'Web UI 发布地址必须是 127.0.0.1、0.0.0.0 或本机 IPv4 地址。'; return 2; }
   ensure_config
   if [[ "$(config_value WEB_UI_BIND_ADDRESS)" == "$bind_address" ]]; then
     info "Web UI 发布范围已是 ${bind_address}，无需修改。"
@@ -867,17 +977,25 @@ configure_web_ui_publish_scope() {
   ensure_config
   printf '\nWeb UI 发布范围（当前：%s）\n' "$(web_ui_bind_address)"
   printf '  1. 仅宿主机：127.0.0.1（推荐与反向代理或共享 Docker 网络配合）\n'
-  printf '  2. 所有 IPv4 接口：0.0.0.0（可直接从公网访问）\n'
-  read -r -p '请选择 [1-2，直接回车取消]：' selected
+  printf '  2. Docker NPM 访问宿主机服务（网关模式，自动识别并验证）\n'
+  printf '  3. 所有 IPv4 接口：0.0.0.0（可直接从公网访问）\n'
+  printf '  0. 返回\n'
+  read -r -p '请选择 [0-3]：' selected
   case "$selected" in
     1) bind_address=127.0.0.1 ;;
-    2) bind_address=0.0.0.0 ;;
-    '') return 0 ;;
+    2)
+      select_npm_gateway_target || return 1
+      bind_address="$NPM_GATEWAY_ADDRESS"
+      ;;
+    3) bind_address=0.0.0.0 ;;
+    ''|0) return 0 ;;
     *) error '无效选项。'; return 1 ;;
   esac
 
   set_web_ui_bind_address "$bind_address" || return 1
-  if [[ "$(current_mode)" == docker && "$bind_address" == 127.0.0.1 ]]; then
+  if [[ "$selected" == 2 && web_ui_enabled ]]; then
+    verify_npm_gateway_connection || true
+  elif [[ "$(current_mode)" == docker && "$bind_address" == 127.0.0.1 ]]; then
     info 'NPM 可继续通过共享 Docker 网络访问 kopia-web-ui:51515；不要在 NPM 中填写 127.0.0.1。'
   fi
 }
@@ -893,8 +1011,10 @@ show_web_ui_status() {
         success "实际监听：$(web_ui_bind_address):$(web_ui_port)"
         if [[ "$(web_ui_bind_address)" == 127.0.0.1 ]]; then
           printf '本机访问：http://127.0.0.1:%s（远程访问请使用反向代理）\n' "$(web_ui_port)"
-        else
+        elif [[ "$(web_ui_bind_address)" == 0.0.0.0 ]]; then
           printf '浏览器访问：http://服务器IP:%s\n' "$(web_ui_port)"
+        else
+          printf 'Docker NPM 上游：http://%s:%s（在 NPM 中填写此地址）\n' "$(web_ui_bind_address)" "$(web_ui_port)"
         fi
       else
         error "未检测到端口监听：$(web_ui_bind_address):$(web_ui_port)"
