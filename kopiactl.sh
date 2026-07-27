@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.20"
+readonly MANAGER_VERSION="1.0.21"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -120,6 +120,7 @@ localize_mode() {
 localize_service_state() {
   case "$1" in
     active) printf '运行中' ;;
+    activating) printf '正在启动' ;;
     inactive) printf '已停止' ;;
     failed) printf '启动失败' ;;
     created) printf '已创建，等待启动' ;;
@@ -135,11 +136,16 @@ localize_service_state() {
 }
 
 write_config() {
-  local mode="$1" enabled="${2:-false}" user="${3:-pingzi}" password="${4:-}" port="${5:-$DEFAULT_WEB_UI_PORT}" repository_password_entry bind_address
+  local mode="$1" enabled="${2:-false}" user="${3:-pingzi}" password="${4:-}" port="${5:-$DEFAULT_WEB_UI_PORT}" repository_password_entry repository_password_b64 bind_address
   if (( $# >= 6 )); then
     repository_password_entry="$6"
   else
     repository_password_entry="$(config_value KOPIA_REPOSITORY_PASSWORD)"
+  fi
+  if (( $# >= 8 )); then
+    repository_password_b64="$8"
+  else
+    repository_password_b64="$(config_value KOPIA_REPOSITORY_PASSWORD_B64)"
   fi
   bind_address="${7:-$(web_ui_bind_address)}"
   [[ "$bind_address" == 0.0.0.0 || "$bind_address" == 127.0.0.1 ]] || bind_address=0.0.0.0
@@ -153,6 +159,7 @@ WEB_UI_PASSWORD=${password}
 WEB_UI_PORT=${port}
 WEB_UI_BIND_ADDRESS=${bind_address}
 KOPIA_REPOSITORY_PASSWORD=${repository_password_entry}
+KOPIA_REPOSITORY_PASSWORD_B64=${repository_password_b64}
 EOF
   chmod 0600 "$CONFIG_FILE"
 }
@@ -447,12 +454,20 @@ configure_r2_repository() {
   fi
   REPOSITORY_PASSWORD="$repository_password"
   success "Cloudflare R2 仓库已配置：${bucket}。R2 密钥已由 Kopia 加密保存；本次菜单会话无需再次输入仓库密码。"
-  if [[ "$(current_mode)" == docker ]] && web_ui_enabled; then
-    info '正在将新的仓库密码应用到 Docker Web UI...'
-    save_docker_web_ui_repository_password || return 1
-    write_compose_file
-    recreate_docker_web_ui || { error 'Web UI 容器重建失败。'; return 1; }
-    success 'Docker Web UI 已连接到新的仓库配置。'
+  if web_ui_enabled; then
+    info '正在将新的仓库密码应用到 Web UI...'
+    save_web_ui_repository_password || return 1
+    case "$(current_mode)" in
+      native)
+        write_native_service || return 1
+        systemctl restart kopia-web-ui.service || { error '原生 Web UI 重启失败。请查看日志。'; return 1; }
+        ;;
+      docker)
+        write_compose_file
+        recreate_docker_web_ui || { error 'Web UI 容器重建失败。'; return 1; }
+        ;;
+    esac
+    success 'Web UI 已连接到新的仓库配置。'
   fi
 }
 
@@ -519,6 +534,31 @@ write_native_service() {
   [[ -n "$password" ]] || { error 'Web UI 密码未设置。'; return 1; }
   service_password="${password//%/%%}"
   service_user="${user//%/%%}"
+  cat >"${MANAGER_DIR}/kopia-web-ui-service.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_file="$1"
+binary="$2"
+bind_address="$3"
+port="$4"
+username="$5"
+web_password="$6"
+repository_config="$7"
+repository_password_b64="$(sed -n 's/^KOPIA_REPOSITORY_PASSWORD_B64=//p' "$config_file" | tail -n 1)"
+
+[[ -n "$repository_password_b64" ]] || {
+  printf 'Kopia repository password is not configured for the Web UI service.\n' >&2
+  exit 64
+}
+KOPIA_PASSWORD="$(printf '%s' "$repository_password_b64" | base64 -d)" || {
+  printf 'Unable to decode the saved Kopia repository password.\n' >&2
+  exit 65
+}
+export KOPIA_PASSWORD
+exec "$binary" server start --insecure --address="${bind_address}:${port}" --server-username="$username" --server-password="$web_password" --config-file="$repository_config"
+EOF
+  chmod 0700 "${MANAGER_DIR}/kopia-web-ui-service.sh"
   cat >"$SERVICE_FILE" <<EOF
 [Unit]
 Description=Kopia Web UI Server
@@ -528,7 +568,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=KOPIA_CONFIG_PATH=${KOPIA_CONFIG_FILE}
-ExecStart=${binary} server start --insecure --address=${bind_address}:${port} --server-username=${service_user} --server-password=${service_password} --config-file=${KOPIA_CONFIG_FILE}
+ExecStart=${MANAGER_DIR}/kopia-web-ui-service.sh ${CONFIG_FILE} ${binary} ${bind_address} ${port} ${service_user} ${service_password} ${KOPIA_CONFIG_FILE}
 Restart=on-failure
 RestartSec=5
 
@@ -552,14 +592,19 @@ docker_web_ui_repository_password_configured() {
   [[ -n "$(config_value KOPIA_REPOSITORY_PASSWORD)" ]]
 }
 
-save_docker_web_ui_repository_password() {
-  local password_entry enabled
+web_ui_repository_password_configured() {
+  [[ -n "$(config_value KOPIA_REPOSITORY_PASSWORD_B64)" ]]
+}
+
+save_web_ui_repository_password() {
+  local password_entry password_b64 enabled
   [[ -f "$KOPIA_CONFIG_FILE" ]] || { error '尚未配置 Kopia 仓库。请先配置 Cloudflare R2 仓库。'; return 1; }
   ensure_repository_password || return 1
   password_entry="$(compose_env_single_quote "$REPOSITORY_PASSWORD")"
+  password_b64="$(printf '%s' "$REPOSITORY_PASSWORD" | base64 | tr -d '\n')"
   enabled="$(web_ui_enabled && printf true || printf false)"
-  write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$password_entry"
-  success 'Docker Web UI 的仓库密码已保存，并将仅以 KOPIA_PASSWORD 注入容器。'
+  write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$password_entry" "$(web_ui_bind_address)" "$password_b64"
+  success 'Web UI 的 Kopia 仓库密码已保存，并将仅用于后台打开仓库。'
 }
 
 recreate_docker_web_ui() {
@@ -630,6 +675,7 @@ configure_web_ui_credentials() {
 start_web_ui() {
   local existing_password
   ensure_config
+  [[ -f "$KOPIA_CONFIG_FILE" ]] || { error '尚未配置 Kopia 仓库。请先选择“配置 Cloudflare R2 仓库”，再启用 Web UI。'; return 1; }
   if ! web_ui_enabled; then
     existing_password="$(config_value WEB_UI_PASSWORD)"
     if [[ -n "$existing_password" ]]; then
@@ -643,14 +689,32 @@ start_web_ui() {
   case "$(current_mode)" in
     native)
       install_native_kopia || return 1
+      if ! web_ui_repository_password_configured; then
+        info '原生 Web UI 需要仓库密码，才能由 systemd 在后台打开仓库。'
+        save_web_ui_repository_password || return 1
+      fi
       write_native_service || return 1
-      systemctl enable --now kopia-web-ui.service || { error 'Web UI 启动失败。请查看日志。'; return 1; }
+      systemctl enable --now kopia-web-ui.service || {
+        error 'Web UI 启动失败。以下为最近的服务日志：'
+        show_web_ui_status
+        return 1
+      }
+      for _ in 1 2 3; do
+        if systemctl is-active --quiet kopia-web-ui.service && native_web_ui_port_listening; then
+          success "Kopia Web UI 已启动：http://服务器IP:$(web_ui_port)"
+          return 0
+        fi
+        sleep 1
+      done
+      error 'Web UI 服务未能在 3 秒内实际监听端口。以下为状态和最近日志：'
+      show_web_ui_status
+      return 1
       ;;
     docker)
       install_docker_kopia || return 1
       if ! docker_web_ui_repository_password_configured; then
         info 'Docker Web UI 需要仓库密码才能在后台打开仓库。'
-        save_docker_web_ui_repository_password || return 1
+        save_web_ui_repository_password || return 1
       fi
       (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d) || { error 'Web UI 容器启动失败。'; return 1; }
       ;;
@@ -672,7 +736,7 @@ stop_web_ui() {
       ;;
   esac
   ensure_config
-  write_config "$(current_mode)" false "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" ''
+  write_config "$(current_mode)" false "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" '' "$(web_ui_bind_address)" ''
   success 'Kopia Web UI 已停止，并设为默认不启用。'
 }
 
@@ -706,7 +770,7 @@ update_docker_web_ui_repository_password() {
   [[ "$(current_mode)" == docker ]] || { warn '仅 Docker 模式的 Web UI 需要保存仓库密码。'; return 0; }
   info '请输入 Kopia 仓库密码。它不同于 Web UI 登录密码和 R2 Secret Access Key。'
   REPOSITORY_PASSWORD=''
-  save_docker_web_ui_repository_password || return 1
+  save_web_ui_repository_password || return 1
   if web_ui_enabled; then
     require_docker || return 1
     write_compose_file
@@ -824,15 +888,19 @@ show_web_ui_status() {
   case "$(current_mode)" in
     native)
       state="$(systemctl is-active kopia-web-ui.service 2>/dev/null || true)"
-      printf 'Web UI：%s\n服务监听：%s:%s\n' \
-        "$(localize_service_state "$state")" "$(web_ui_bind_address)" "$(web_ui_port)"
-      if [[ "$(web_ui_bind_address)" == 127.0.0.1 ]]; then
-        printf '本机访问：http://127.0.0.1:%s（远程访问请使用反向代理）\n' "$(web_ui_port)"
+      printf 'Web UI：%s\n' "$(localize_service_state "$state")"
+      if native_web_ui_port_listening; then
+        success "实际监听：$(web_ui_bind_address):$(web_ui_port)"
+        if [[ "$(web_ui_bind_address)" == 127.0.0.1 ]]; then
+          printf '本机访问：http://127.0.0.1:%s（远程访问请使用反向代理）\n' "$(web_ui_port)"
+        else
+          printf '浏览器访问：http://服务器IP:%s\n' "$(web_ui_port)"
+        fi
       else
-        printf '浏览器访问：http://服务器IP:%s\n' "$(web_ui_port)"
+        error "未检测到端口监听：$(web_ui_bind_address):$(web_ui_port)"
       fi
-      if [[ "$state" == failed ]]; then
-        error '错误点请查看下方 systemd 日志，重点关注启动命令、端口占用和仓库配置报错。'
+      if [[ "$state" != active ]] || ! native_web_ui_port_listening; then
+        error 'Web UI 尚不可访问。请检查下方日志中的仓库配置、仓库密码、端口或网络错误。'
         journalctl -u kopia-web-ui.service -n 60 --no-pager 2>&1 || true
       fi
       ;;
@@ -1043,7 +1111,13 @@ web_ui_runtime_status() {
     native)
       state="$(systemctl is-active kopia-web-ui.service 2>/dev/null || true)"
       case "$state" in
-        active) printf '%s运行中%s' "$GREEN" "$RESET" ;;
+        active)
+          if native_web_ui_port_listening; then
+            printf '%s运行中%s' "$GREEN" "$RESET"
+          else
+            printf '%s端口未监听%s' "$RED" "$RESET"
+          fi
+          ;;
         failed) printf '%s启动失败%s' "$RED" "$RESET" ;;
         *) printf '%s已启用，未运行%s' "$YELLOW" "$RESET" ;;
       esac
@@ -1058,6 +1132,11 @@ web_ui_runtime_status() {
       esac
       ;;
   esac
+}
+
+native_web_ui_port_listening() {
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -ltnH "sport = :$(web_ui_port)" 2>/dev/null | grep -q .
 }
 
 repository_config_status() {
