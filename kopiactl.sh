@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.25"
+readonly MANAGER_VERSION="1.0.26"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -12,6 +12,8 @@ readonly KOPIA_CONFIG_FILE="${INSTALL_DIR}/config/repository.config"
 readonly CACHE_DIR="${INSTALL_DIR}/cache"
 readonly COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
 readonly BACKUP_DIR="/var/backups/kopiactl"
+readonly SCHEDULE_DIR="${INSTALL_DIR}/schedules"
+readonly SCHEDULE_UNIT_PREFIX="kopiactl-backup-"
 readonly MANAGER_DIR="/usr/local/lib/kopiactl"
 readonly MANAGER_SCRIPT="${MANAGER_DIR}/kopiactl.sh"
 readonly MANAGER_COMMAND="/usr/local/bin/kopiactl"
@@ -66,10 +68,11 @@ read_secret_with_length() {
 show_command_usage() {
   cat <<'USAGE'
 KopiaCtl 是 Kopia 的交互式原生 / Docker 管理菜单。
-用法：kopiactl [--install-manager] [--help] [web-ui set-bind <IPv4地址>]
+用法：kopiactl [--install-manager] [--help] [web-ui set-bind <IPv4地址>] [schedule-run <任务ID>]
   --install-manager      安装 kopiactl 命令入口，供安装器调用
   --help, -h             显示本帮助
   web-ui set-bind <地址>  设置 Web UI 宿主机发布地址，供其他管理器调用
+  schedule-run <任务ID>  运行由 systemd 定时器触发的备份任务
 USAGE
 }
 
@@ -507,6 +510,385 @@ create_snapshot() {
   else
     run_kopia_authenticated snapshot create "$path"
   fi
+  if confirm_action '快照已创建。是否现在为此文件夹设置自动备份？'; then
+    configure_backup_schedule_for_path "$path"
+  fi
+}
+
+schedule_task_id_for_path() {
+  printf '%s' "$1" | sha256sum | awk '{print substr($1, 1, 16)}'
+}
+
+schedule_file_for_path() {
+  printf '%s/%s.conf\n' "$SCHEDULE_DIR" "$(schedule_task_id_for_path "$1")"
+}
+
+schedule_unit_name() {
+  printf '%s%s\n' "$SCHEDULE_UNIT_PREFIX" "$1"
+}
+
+is_valid_schedule_interval() { [[ "$1" =~ ^[1-9][0-9]*(m|h)$ ]]; }
+
+is_valid_schedule_time() {
+  local hour minute
+  [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || return 1
+  IFS=: read -r hour minute <<< "$1"
+  (( 10#$hour <= 23 && 10#$minute <= 59 ))
+}
+
+schedule_encode_path() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+SCHEDULE_PATH=''
+SCHEDULE_MODE=''
+SCHEDULE_KIND=''
+SCHEDULE_VALUE=''
+SCHEDULE_ID=''
+
+load_schedule_file() {
+  local file="$1" path_b64
+  [[ -f "$file" ]] || return 1
+  SCHEDULE_ID="$(sed -n 's/^TASK_ID=//p' "$file" | tail -n 1)"
+  path_b64="$(sed -n 's/^PATH_B64=//p' "$file" | tail -n 1)"
+  SCHEDULE_MODE="$(sed -n 's/^MODE=//p' "$file" | tail -n 1)"
+  SCHEDULE_KIND="$(sed -n 's/^KIND=//p' "$file" | tail -n 1)"
+  SCHEDULE_VALUE="$(sed -n 's/^VALUE=//p' "$file" | tail -n 1)"
+  [[ "$SCHEDULE_ID" =~ ^[a-f0-9]{16}$ && -n "$path_b64" ]] || return 1
+  SCHEDULE_PATH="$(printf '%s' "$path_b64" | base64 -d 2>/dev/null)" || return 1
+  [[ "$SCHEDULE_PATH" == /* && "$SCHEDULE_PATH" != *$'\n'* ]] || return 1
+  [[ "$SCHEDULE_MODE" == policy || "$SCHEDULE_MODE" == timer ]] || return 1
+  case "$SCHEDULE_KIND" in
+    interval) is_valid_schedule_interval "$SCHEDULE_VALUE" ;;
+    daily) is_valid_schedule_time "$SCHEDULE_VALUE" ;;
+    *) return 1 ;;
+  esac
+}
+
+write_schedule_file() {
+  local path="$1" mode="$2" kind="$3" value="$4" id file
+  id="$(schedule_task_id_for_path "$path")"
+  file="$(schedule_file_for_path "$path")"
+  install -d -m 0700 "$SCHEDULE_DIR" || return 1
+  cat >"$file" <<EOF
+# 由 KopiaCtl 管理；请通过“自动备份管理”修改。
+TASK_ID=${id}
+PATH_B64=$(schedule_encode_path "$path")
+MODE=${mode}
+KIND=${kind}
+VALUE=${value}
+EOF
+  chmod 0600 "$file"
+}
+
+disable_timer_schedule() {
+  local id="$1" unit
+  [[ "$id" =~ ^[a-f0-9]{16}$ ]] || return 1
+  unit="$(schedule_unit_name "$id")"
+  systemctl disable --now "${unit}.timer" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${unit}.service" "/etc/systemd/system/${unit}.timer"
+  systemctl daemon-reload
+}
+
+disable_all_managed_timer_schedules() {
+  local file
+  for file in "$SCHEDULE_DIR"/*.conf; do
+    [[ -e "$file" ]] || continue
+    load_schedule_file "$file" || continue
+    disable_timer_schedule "$SCHEDULE_ID"
+  done
+}
+
+has_managed_timer_schedule() {
+  local file
+  for file in "$SCHEDULE_DIR"/*.conf; do
+    [[ -e "$file" ]] || continue
+    load_schedule_file "$file" || continue
+    [[ "$SCHEDULE_MODE" != timer ]] || return 0
+  done
+  return 1
+}
+
+write_timer_schedule_units() {
+  local id="$1" kind="$2" value="$3" unit timer_value
+  [[ "$id" =~ ^[a-f0-9]{16}$ ]] || return 1
+  unit="$(schedule_unit_name "$id")"
+  case "$kind" in
+    interval)
+      is_valid_schedule_interval "$value" || return 1
+      timer_value="OnUnitActiveSec=${value}"
+      ;;
+    daily)
+      is_valid_schedule_time "$value" || return 1
+      timer_value="OnCalendar=*-*-* ${value}:00"
+      ;;
+    *) return 1 ;;
+  esac
+  cat >"/etc/systemd/system/${unit}.service" <<EOF
+[Unit]
+Description=KopiaCtl scheduled backup ${id}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${MANAGER_COMMAND} schedule-run ${id}
+EOF
+  cat >"/etc/systemd/system/${unit}.timer" <<EOF
+[Unit]
+Description=KopiaCtl backup timer ${id}
+
+[Timer]
+${timer_value}
+Persistent=true
+Unit=${unit}.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 0644 "/etc/systemd/system/${unit}.service" "/etc/systemd/system/${unit}.timer"
+  systemctl daemon-reload || return 1
+  systemctl enable --now "${unit}.timer" || return 1
+}
+
+save_scheduler_repository_password() {
+  local password_entry password_b64 enabled
+  [[ -f "$KOPIA_CONFIG_FILE" ]] || { error '尚未配置 Kopia 仓库。'; return 1; }
+  ensure_repository_password || return 1
+  password_entry="$(compose_env_single_quote "$REPOSITORY_PASSWORD")"
+  password_b64="$(printf '%s' "$REPOSITORY_PASSWORD" | base64 | tr -d '\n')"
+  enabled="$(web_ui_enabled && printf true || printf false)"
+  write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$password_entry" "$(web_ui_bind_address)" "$password_b64"
+}
+
+apply_backup_schedule() {
+  local path="$1" mode="$2" kind="$3" value="$4" id schedule_args=()
+  [[ "$path" == /* && -e "$path" && "$path" != *$'\n'* ]] || { error '备份路径必须是存在的 Linux 绝对路径。'; return 1; }
+  case "$kind" in
+    interval) is_valid_schedule_interval "$value" || { error '间隔仅支持正整数加 m 或 h，例如 30m、6h。'; return 1; } ;;
+    daily) is_valid_schedule_time "$value" || { error '每日时间应为 24 小时制 HH:MM，例如 02:30。'; return 1; } ;;
+    *) error '无效的计划类型。'; return 1 ;;
+  esac
+  id="$(schedule_task_id_for_path "$path")"
+  case "$kind" in
+    interval) schedule_args=("--snapshot-interval=${value}" --run-missed=true) ;;
+    daily) schedule_args=("--snapshot-time=${value}" --run-missed=true) ;;
+  esac
+  ensure_repository_password || return 1
+  info '正在更新 Kopia 策略，防止同一文件夹被两个计划重复备份...'
+  run_kopia_authenticated policy set "$path" --manual || return 1
+  case "$mode" in
+    policy)
+      run_kopia_authenticated policy set "$path" "${schedule_args[@]}" || return 1
+      disable_timer_schedule "$id"
+      write_schedule_file "$path" policy "$kind" "$value" || return 1
+      success '已启用 Kopia 策略自动备份，并已停止该文件夹的独立 systemd 定时器。'
+      warn '此模式需要 Kopia Web UI 服务/容器持续运行；关闭浏览器不会影响计划，停止服务或容器会暂停计划。'
+      ;;
+    timer)
+      save_scheduler_repository_password || return 1
+      write_schedule_file "$path" timer "$kind" "$value" || return 1
+      write_timer_schedule_units "$id" "$kind" "$value" || return 1
+      success '已启用独立 systemd 自动备份，并将 Kopia 策略设为手动以避免重复执行。'
+      warn '此模式不依赖 Web UI；计划不会显示在 Kopia Web UI 的策略页面。'
+      ;;
+    *) error '无效的自动备份模式。'; return 1 ;;
+  esac
+}
+
+configure_backup_schedule_for_path() {
+  local path="$1" mode_choice kind_choice value mode kind
+  [[ "$path" == /* && -e "$path" ]] || { error '备份路径必须是存在的 Linux 绝对路径。'; return 1; }
+  printf '\n%s自动备份：%s%s\n' "$BOLD" "$path" "$RESET"
+  printf '  1. Kopia 策略（Web UI 可查看和修改；需要 Web UI 服务/容器运行）\n'
+  printf '  2. 独立 systemd 定时器（Web UI 停止后仍可运行；不会显示在 Web UI）\n'
+  printf '  0. 返回\n'
+  read -r -p '请选择模式 [0-2]：' mode_choice
+  case "$mode_choice" in
+    1) mode=policy ;;
+    2) mode=timer ;;
+    0) return 0 ;;
+    *) error '无效选项。'; return 1 ;;
+  esac
+  printf '\n  1. 按间隔执行（例如每 6 小时）\n'
+  printf '  2. 每日固定时间执行\n'
+  read -r -p '请选择计划 [1-2]：' kind_choice
+  case "$kind_choice" in
+    1)
+      kind=interval
+      read -r -p '间隔（正整数加 m 或 h，例如 30m、6h）：' value
+      is_valid_schedule_interval "$value" || { error '间隔仅支持正整数加 m 或 h，例如 30m、6h。'; return 1; }
+      ;;
+    2)
+      kind=daily
+      read -r -p '每日执行时间（24 小时制 HH:MM，例如 02:30）：' value
+      is_valid_schedule_time "$value" || { error '每日时间应为 24 小时制 HH:MM，例如 02:30。'; return 1; }
+      ;;
+    *) error '无效选项。'; return 1 ;;
+  esac
+  if [[ "$mode" == timer ]]; then
+    warn '独立 systemd 定时器需要将仓库密码保存在 /opt/kopiactl/kopiactl.env（权限 0600），以供无人值守快照使用。'
+    confirm_action '确认保存密码并启用此定时器？' || { info '已取消。'; return 0; }
+  fi
+  apply_backup_schedule "$path" "$mode" "$kind" "$value"
+}
+
+configure_backup_schedule() {
+  local path
+  read -r -p '请输入要自动备份的绝对路径：' path
+  configure_backup_schedule_for_path "$path"
+}
+
+list_managed_backup_schedules() {
+  local file state mode_label schedule_label found=false unit
+  printf '\n%sKopiaCtl 管理的自动备份%s\n' "$BOLD" "$RESET"
+  for file in "$SCHEDULE_DIR"/*.conf; do
+    [[ -e "$file" ]] || continue
+    if ! load_schedule_file "$file"; then
+      warn "已忽略无效计划文件：${file}"
+      continue
+    fi
+    found=true
+    case "$SCHEDULE_MODE" in policy) mode_label='Kopia 策略（Web UI）' ;; timer) mode_label='独立 systemd 定时器' ;; esac
+    case "$SCHEDULE_KIND" in interval) schedule_label="每 ${SCHEDULE_VALUE}" ;; daily) schedule_label="每日 ${SCHEDULE_VALUE}" ;; esac
+    if [[ "$SCHEDULE_MODE" == timer ]]; then
+      unit="$(schedule_unit_name "$SCHEDULE_ID")"
+      state="$(systemctl is-active "${unit}.timer" 2>/dev/null || true)"
+      printf '  - %s | %s | %s | 定时器：%s\n' "$SCHEDULE_PATH" "$mode_label" "$schedule_label" "$(localize_service_state "$state")"
+    else
+      printf '  - %s | %s | %s\n' "$SCHEDULE_PATH" "$mode_label" "$schedule_label"
+    fi
+  done
+  "$found" || info '没有由 KopiaCtl 管理的自动备份。'
+}
+
+select_managed_backup_schedule() {
+  local file choice=0 count=0
+  SCHEDULE_FILES=()
+  for file in "$SCHEDULE_DIR"/*.conf; do
+    [[ -e "$file" ]] || continue
+    load_schedule_file "$file" || continue
+    SCHEDULE_FILES+=("$file")
+    ((count++))
+    printf '  %d. %s（%s：%s）\n' "$count" "$SCHEDULE_PATH" "$SCHEDULE_MODE" "$SCHEDULE_VALUE"
+  done
+  (( count > 0 )) || { info '没有可选择的自动备份。'; return 1; }
+  read -r -p "请选择 [1-${count}，输入0返回]：" choice
+  [[ "$choice" == 0 ]] && return 1
+  [[ "$choice" =~ ^[1-9][0-9]*$ && "$choice" -le "$count" ]] || { error '无效选项。'; return 1; }
+  load_schedule_file "${SCHEDULE_FILES[$((choice - 1))]}"
+}
+
+sync_managed_backup_schedules() {
+  local file mode_label schedule_label total=0 succeeded=0 failed=0 skipped=0
+  local -a schedule_files=()
+  printf '\n%s自动备份策略同步预览%s\n' "$BOLD" "$RESET"
+  for file in "$SCHEDULE_DIR"/*.conf; do
+    [[ -e "$file" ]] || continue
+    if ! load_schedule_file "$file"; then
+      warn "已跳过无效计划文件：${file}"
+      ((skipped++))
+      continue
+    fi
+    if [[ ! -e "$SCHEDULE_PATH" ]]; then
+      warn "已跳过不存在的目录：${SCHEDULE_PATH}"
+      ((skipped++))
+      continue
+    fi
+    case "$SCHEDULE_MODE" in policy) mode_label='Kopia 策略（Web UI）' ;; timer) mode_label='独立 systemd 定时器' ;; esac
+    case "$SCHEDULE_KIND" in interval) schedule_label="每 ${SCHEDULE_VALUE}" ;; daily) schedule_label="每日 ${SCHEDULE_VALUE}" ;; esac
+    ((total++))
+    printf '  %d. %s | %s | %s\n' "$total" "$SCHEDULE_PATH" "$mode_label" "$schedule_label"
+    schedule_files+=("$file")
+  done
+  (( total > 0 )) || { info '没有可同步的已管理自动备份。'; return 0; }
+  warn '同步会以 KopiaCtl 保存的策略覆盖上述路径当前的 Kopia Policy 或 systemd timer。'
+  if has_managed_timer_schedule; then
+    warn '预览中包含独立定时器；同步时会保留或更新无人值守备份所需的受限仓库密码。'
+  fi
+  confirm_action "确认同步以上 ${total} 个自动备份策略？" || { info '已取消同步。'; return 0; }
+  ensure_repository_password || return 1
+  for file in "${schedule_files[@]}"; do
+    load_schedule_file "$file" || { ((failed++)); continue; }
+    if apply_backup_schedule "$SCHEDULE_PATH" "$SCHEDULE_MODE" "$SCHEDULE_KIND" "$SCHEDULE_VALUE"; then
+      ((succeeded++))
+    else
+      ((failed++))
+      error "同步失败：${SCHEDULE_PATH}"
+    fi
+  done
+  if (( failed == 0 )); then
+    success "自动备份策略同步完成：成功 ${succeeded} 个，跳过 ${skipped} 个。"
+  else
+    warn "自动备份策略同步结束：成功 ${succeeded} 个，失败 ${failed} 个，跳过 ${skipped} 个。"
+    return 1
+  fi
+}
+
+remove_managed_backup_schedule() {
+  local path id mode
+  printf '\n请选择要停用的自动备份：\n'
+  select_managed_backup_schedule || return 0
+  # load_schedule_file has populated the selected task fields.
+  path="$SCHEDULE_PATH"
+  id="$SCHEDULE_ID"
+  mode="$SCHEDULE_MODE"
+  confirm_action "确认停用 ${path} 的自动备份？" || { info '已取消。'; return 0; }
+  if [[ "$mode" == policy ]]; then
+    ensure_repository_password || return 1
+    run_kopia_authenticated policy set "$path" --manual || return 1
+  fi
+  disable_timer_schedule "$id"
+  rm -f "${SCHEDULE_DIR}/${id}.conf"
+  if ! web_ui_enabled && ! has_managed_timer_schedule; then
+    write_config "$(current_mode)" false "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" '' "$(web_ui_bind_address)" ''
+  fi
+  success '自动备份已停用。'
+}
+
+run_scheduled_backup() {
+  local id="$1" file password_b64 password mode path
+  [[ "$id" =~ ^[a-f0-9]{16}$ ]] || { error '无效的定时任务 ID。'; return 2; }
+  file="${SCHEDULE_DIR}/${id}.conf"
+  load_schedule_file "$file" || { error '找不到或无法读取定时任务配置。'; return 1; }
+  [[ "$SCHEDULE_MODE" == timer ]] || { error '该任务不是独立 systemd 定时器。'; return 1; }
+  path="$SCHEDULE_PATH"
+  [[ -e "$path" ]] || { error "备份路径不存在：${path}"; return 1; }
+  password_b64="$(config_value KOPIA_REPOSITORY_PASSWORD_B64)"
+  password="$(printf '%s' "$password_b64" | base64 -d 2>/dev/null)" || { error '无法读取已保存的仓库密码。'; return 1; }
+  [[ -n "$password" ]] || { error '未保存仓库密码，无法执行无人值守备份。请重新设置此定时器。'; return 1; }
+  case "$(current_mode)" in
+    native)
+      KOPIA_PASSWORD="$password" native_kopia snapshot create "$path"
+      ;;
+    docker)
+      require_docker || return 1
+      KOPIA_PASSWORD="$password" docker run --rm -e KOPIA_PASSWORD \
+        -v "$(dirname "$KOPIA_CONFIG_FILE"):/app/config" \
+        -v "$CACHE_DIR:/app/cache" \
+        -v "${path}:${path}:ro" \
+        "$KOPIA_IMAGE" --config-file=/app/config/repository.config snapshot create "$path"
+      ;;
+  esac
+}
+
+backup_schedule_menu() {
+  local selected
+  while true; do
+    printf '\n%s自动备份管理%s\n' "$BOLD" "$RESET"
+    printf '  1. 为文件夹设置或切换自动备份模式\n'
+    printf '  2. 查看 KopiaCtl 管理的自动备份\n'
+    printf '  3. 同步全部已管理自动备份策略\n'
+    printf '  4. 停用文件夹自动备份\n'
+    printf '  0. 返回\n'
+    read -r -p '请选择 [0-4]：' selected
+    case "$selected" in
+      1) configure_backup_schedule; pause_menu ;;
+      2) list_managed_backup_schedules; pause_menu ;;
+      3) sync_managed_backup_schedules; pause_menu ;;
+      4) remove_managed_backup_schedule; pause_menu ;;
+      0) return 0 ;;
+      *) warn '无效选项。' ;;
+    esac
+  done
 }
 
 list_snapshots() { run_kopia_authenticated snapshot list; }
@@ -846,6 +1228,7 @@ start_web_ui() {
 }
 
 stop_web_ui() {
+  local repository_password_entry repository_password_b64
   case "$(current_mode)" in
     native)
       systemctl disable --now kopia-web-ui.service 2>/dev/null || true
@@ -855,8 +1238,15 @@ stop_web_ui() {
       ;;
   esac
   ensure_config
-  write_config "$(current_mode)" false "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" '' "$(web_ui_bind_address)" ''
-  success 'Kopia Web UI 已停止，并设为默认不启用。'
+  if has_managed_timer_schedule; then
+    repository_password_entry="$(config_value KOPIA_REPOSITORY_PASSWORD)"
+    repository_password_b64="$(config_value KOPIA_REPOSITORY_PASSWORD_B64)"
+    write_config "$(current_mode)" false "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$repository_password_entry" "$(web_ui_bind_address)" "$repository_password_b64"
+    success 'Kopia Web UI 已停止；独立自动备份所需的仓库密码已保留。'
+  else
+    write_config "$(current_mode)" false "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" '' "$(web_ui_bind_address)" ''
+    success 'Kopia Web UI 已停止，并设为默认不启用。'
+  fi
 }
 
 web_ui_menu() {
@@ -1174,7 +1564,7 @@ backup_local_config() {
   install -d -m 0750 "$BACKUP_DIR"
   archive="${BACKUP_DIR}/kopiactl-config.$(timestamp).tar.gz"
   confirm_action "确认创建本地 Kopia 配置备份 ${archive}？" || { info '已取消。'; return 0; }
-  for item in config cache kopiactl.env compose.yml; do
+  for item in config cache schedules kopiactl.env compose.yml; do
     [[ -e "${INSTALL_DIR}/${item}" ]] && backup_items+=("$item")
   done
   (( ${#backup_items[@]} > 0 )) || { error '没有可备份的本地 Kopia 配置。'; return 1; }
@@ -1231,8 +1621,9 @@ remove_manager_files() {
 uninstall_manager() {
   warn '这将删除 kopiactl 命令和管理脚本，但不会修改 Kopia、仓库配置或远端快照。'
   confirm_action '确认卸载 KopiaCtl 管理菜单？' || { info '已取消。'; return 0; }
+  disable_all_managed_timer_schedules
   remove_manager_files
-  success 'KopiaCtl 管理菜单已卸载；Kopia 与仓库配置保持不变。'
+  success 'KopiaCtl 管理菜单已卸载；独立自动备份已停止，Kopia 与仓库配置保持不变。'
 }
 
 uninstall_everything() {
@@ -1240,6 +1631,7 @@ uninstall_everything() {
   warn "这还将永久删除 ${INSTALL_DIR} 与 ${BACKUP_DIR} 中的本地配置、缓存和备份。"
   warn 'Cloudflare R2 中的仓库与快照不会被删除。'
   confirm_action '确认完全卸载 Kopia 和 KopiaCtl？此操作不可恢复。' || { info '已取消。'; return 0; }
+  disable_all_managed_timer_schedules
   remove_kopia_runtime || return 1
   rm -f /etc/apt/sources.list.d/kopia.list /usr/share/keyrings/kopia-keyring.gpg "$SERVICE_FILE"
   systemctl daemon-reload
@@ -1373,6 +1765,7 @@ draw_menu() {
   printf ' 10. 查看 Web UI 日志\n'
   printf ' 11. 备份本地 Kopia 配置\n'
   printf ' 12. 卸载 Kopia 或 KopiaCtl\n'
+  printf ' 13. 自动备份管理\n'
   printf '  0. 退出\n'
   printf '%s============================================%s\n' "$BLUE" "$RESET"
   printf '提示：默认原生安装、Cloudflare R2 仓库、Web UI 关闭。\n'
@@ -1384,7 +1777,7 @@ main_menu() {
   ensure_config
   while true; do
     draw_menu
-    read -r -p '请选择 [0-12]：' choice || exit 0
+    read -r -p '请选择 [0-13]：' choice || exit 0
     printf '\n'
     case "$choice" in
       1)
@@ -1411,6 +1804,7 @@ main_menu() {
         fi
         pause_menu
         ;;
+      13) backup_schedule_menu ;;
       0) exit 0 ;;
       *) warn '无效选项。'; pause_menu ;;
     esac
@@ -1422,6 +1816,11 @@ if [[ $# -eq 1 && "$1" == --install-manager ]]; then require_root "$@"; install_
 if [[ $# -eq 3 && "$1" == web-ui && "$2" == set-bind ]]; then
   require_root "$@"
   set_web_ui_bind_address "$3"
+  exit $?
+fi
+if [[ $# -eq 2 && "$1" == schedule-run ]]; then
+  require_root "$@"
+  run_scheduled_backup "$2"
   exit $?
 fi
 [[ $# -eq 0 ]] || { show_command_usage; exit 2; }

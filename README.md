@@ -9,6 +9,7 @@
 | 两种部署方式 | 可安装原生 Kopia 或 Docker Kopia。Docker 模式会安装 Docker Engine/Compose 并下载 `kopia/kopia` 镜像；切换时保留同一份仓库配置。 |
 | Cloudflare R2 | 引导连接已有仓库，或在空 R2 Bucket 中创建新仓库。R2 密钥由 Kopia 的仓库配置保存，不写入 KopiaCtl 菜单配置。 |
 | 快照与恢复 | 交互式创建快照、列出快照；恢复前会自动显示可恢复快照列表，再输入要恢复的快照 ID。Docker 模式会临时只读挂载备份路径。 |
+| 自动备份 | 每个文件夹可选择 Kopia 策略模式，或独立 systemd 定时器模式；两者互斥。支持按间隔或每日固定时间执行，并可预览后批量同步全部由 KopiaCtl 管理的计划。 |
 | Web UI | 默认关闭；可单独启用、启动、停止、查看或修改登录凭据。原生模式使用 systemd，Docker 模式使用 Compose profile；异常状态会以中文显示退出信息和最近错误日志。 |
 | 日常维护 | 查看状态、仓库状态和日志，备份本地配置；可分别卸载 Kopia、KopiaCtl 或两者。 |
 
@@ -46,7 +47,16 @@ kopiactl
 
 建议的首次操作顺序：选择安装方式（小型服务器选原生安装）→ 配置 Cloudflare R2 仓库 → 创建首个快照。Web UI 仅在确有浏览器管理需求时从菜单启用。
 
-R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Access Key。KopiaCtl 自动使用 `<Account ID>.r2.cloudflarestorage.com` 作为 S3 endpoint，使用 `region=auto`。连接已有仓库时还需要输入该 Kopia 仓库的加密密码；它不是 R2 Secret Access Key。创建新仓库时，菜单会要求设置并确认这个密码。仓库密码通常仅保留在当前菜单进程的内存中；但启用原生或 Docker Web UI 时，菜单会将它保存到权限为 `0600` 的 `/opt/kopiactl/kopiactl.env`，以便后台服务通过 `KOPIA_PASSWORD` 打开仓库。停用 Web UI 时会清除该已保存的密码。
+R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Access Key。KopiaCtl 自动使用 `<Account ID>.r2.cloudflarestorage.com` 作为 S3 endpoint，使用 `region=auto`。连接已有仓库时还需要输入该 Kopia 仓库的加密密码；它不是 R2 Secret Access Key。创建新仓库时，菜单会要求设置并确认这个密码。仓库密码通常仅保留在当前菜单进程的内存中；启用原生或 Docker Web UI，或启用独立 systemd 自动备份时，菜单会将它保存到权限为 `0600` 的 `/opt/kopiactl/kopiactl.env`，以便后台服务通过 `KOPIA_PASSWORD` 打开仓库。停用 Web UI 时，若仍有独立定时器，密码会继续保留供定时器使用。
+
+## 自动备份
+
+主菜单的“自动备份管理”提供两种互斥模式。同一文件夹切换模式时，KopiaCtl 会停止另一种触发方式，避免重复创建快照。
+
+- **Kopia 策略**：使用 `kopia policy set` 写入计划，可在 Web UI 的策略页面查看和修改。计划执行依赖运行中的 Kopia Web UI 服务或容器；关闭浏览器不影响它，但停止 `kopia-web-ui.service` 或 `kopia-web-ui` 容器会暂停它。
+- **独立 systemd 定时器**：使用每个文件夹独立的 `kopiactl-backup-*.timer`，即使 Web UI 服务或容器停止也会运行。它不会显示在 Kopia Web UI 中，并需要在本机受限配置文件保存仓库密码。
+
+计划可以按 `30m`、`6h` 这类间隔执行，也可以每日在固定时间执行。创建手动快照成功后可直接为该路径设置自动备份。菜单的“同步全部已管理自动备份策略”会先列出全部有效路径、模式与时间规则；仅在确认后，才将 KopiaCtl 保存的设置重新应用到对应的 Kopia Policy 或 systemd timer。它会覆盖这些路径当前的实际计划，但不会读取或双向同步用户后来直接在 Web UI 中修改的任意策略；若直接在 Web UI 修改策略，请在 KopiaCtl 中重新设置该路径后再执行同步。
 
 ## 文件位置
 
@@ -54,6 +64,8 @@ R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Acc
 | --- | --- |
 | KopiaCtl 设置、Kopia 仓库配置与缓存 | `/opt/kopiactl/` |
 | Docker Compose 配置 | `/opt/kopiactl/compose.yml` |
+| 自动备份任务配置 | `/opt/kopiactl/schedules/` |
+| 独立自动备份 systemd units | `/etc/systemd/system/kopiactl-backup-*.service`、`/etc/systemd/system/kopiactl-backup-*.timer` |
 | 原生 Web UI systemd 服务 | `/etc/systemd/system/kopia-web-ui.service` |
 | KopiaCtl 本地配置备份 | `/var/backups/kopiactl/` |
 | 管理脚本 | `/usr/local/lib/kopiactl/kopiactl.sh` |
