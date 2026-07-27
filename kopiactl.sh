@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.22"
+readonly MANAGER_VERSION="1.0.23"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -937,16 +937,56 @@ modify_web_ui_credentials() {
   fi
 }
 
+native_web_ui_port_listening_on() {
+  local bind_address="$1" port="$(web_ui_port)"
+  command -v ss >/dev/null 2>&1 || return 1
+  if [[ "$bind_address" == 0.0.0.0 ]]; then
+    ss -ltnH "sport = :${port}" 2>/dev/null | grep -Eq "(^|[[:space:]])(0\.0\.0\.0|\*):${port}([[:space:]]|$)"
+  else
+    ss -ltnH "sport = :${port}" 2>/dev/null | grep -Fq -- "${bind_address}:${port}"
+  fi
+}
+
+docker_web_ui_port_published_on() {
+  local bind_address="$1" port="$(web_ui_port)"
+  docker inspect --format "{{range (index .NetworkSettings.Ports \"${port}/tcp\")}}{{println .HostIp}}{{end}}" kopia-web-ui 2>/dev/null | grep -Fxq "$bind_address"
+}
+
+web_ui_bind_address_is_active() {
+  local bind_address="$1"
+  case "$(current_mode)" in
+    native) native_web_ui_port_listening_on "$bind_address" ;;
+    docker) docker_web_ui_port_published_on "$bind_address" ;;
+  esac
+}
+
+wait_for_web_ui_bind_address() {
+  local bind_address="$1" attempt
+  for ((attempt = 1; attempt <= 5; attempt++)); do
+    web_ui_bind_address_is_active "$bind_address" && return 0
+    sleep 1
+  done
+  return 1
+}
+
 set_web_ui_bind_address() {
-  local bind_address="$1" enabled
+  local bind_address="$1" enabled configured_address
   is_web_ui_bind_address "$bind_address" || { error 'Web UI 发布地址必须是 127.0.0.1、0.0.0.0 或本机 IPv4 地址。'; return 2; }
   ensure_config
-  if [[ "$(config_value WEB_UI_BIND_ADDRESS)" == "$bind_address" ]]; then
+  enabled="$(web_ui_enabled && printf true || printf false)"
+  configured_address="$(config_value WEB_UI_BIND_ADDRESS)"
+  if [[ "$configured_address" == "$bind_address" && "$enabled" != true ]]; then
     info "Web UI 发布范围已是 ${bind_address}，无需修改。"
     return 0
   fi
+  if [[ "$configured_address" == "$bind_address" && "$enabled" == true ]] && web_ui_bind_address_is_active "$bind_address"; then
+    info "Web UI 发布范围已是 ${bind_address}，无需修改。"
+    return 0
+  fi
+  if [[ "$configured_address" == "$bind_address" && "$enabled" == true ]]; then
+    warn "配置为 ${bind_address}，但实际监听或端口映射不一致；将重新应用并验证。"
+  fi
 
-  enabled="$(web_ui_enabled && printf true || printf false)"
   write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$(config_value KOPIA_REPOSITORY_PASSWORD)" "$bind_address"
   if [[ "$enabled" != true ]]; then
     success "Web UI 发布范围已保存为 ${bind_address}；将在下次启用时生效。"
@@ -969,6 +1009,11 @@ set_web_ui_bind_address() {
       recreate_docker_web_ui || { error 'Web UI 容器重建失败。'; return 1; }
       ;;
   esac
+  if ! wait_for_web_ui_bind_address "$bind_address"; then
+    error "Web UI 未能实际应用发布范围 ${bind_address}:$(web_ui_port)。"
+    show_web_ui_status
+    return 1
+  fi
   success "Web UI 发布范围已改为 ${bind_address}。"
 }
 
@@ -1255,8 +1300,7 @@ web_ui_runtime_status() {
 }
 
 native_web_ui_port_listening() {
-  command -v ss >/dev/null 2>&1 || return 1
-  ss -ltnH "sport = :$(web_ui_port)" 2>/dev/null | grep -q .
+  native_web_ui_port_listening_on "$(web_ui_bind_address)"
 }
 
 repository_config_status() {
