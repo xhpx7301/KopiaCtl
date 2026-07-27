@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.19"
+readonly MANAGER_VERSION="1.0.20"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -66,9 +66,10 @@ read_secret_with_length() {
 show_command_usage() {
   cat <<'USAGE'
 KopiaCtl 是 Kopia 的交互式原生 / Docker 管理菜单。
-用法：kopiactl [--install-manager] [--help]
+用法：kopiactl [--install-manager] [--help] [web-ui set-bind <127.0.0.1|0.0.0.0>]
   --install-manager      安装 kopiactl 命令入口，供安装器调用
   --help, -h             显示本帮助
+  web-ui set-bind <地址>  设置 Web UI 宿主机发布地址，供其他管理器调用
 USAGE
 }
 
@@ -759,19 +760,17 @@ modify_web_ui_credentials() {
   fi
 }
 
-configure_web_ui_publish_scope() {
-  local selected bind_address enabled
-  ensure_config
-  printf '\nWeb UI 发布范围（当前：%s）\n' "$(web_ui_bind_address)"
-  printf '  1. 仅宿主机：127.0.0.1（推荐与反向代理或共享 Docker 网络配合）\n'
-  printf '  2. 所有 IPv4 接口：0.0.0.0（可直接从公网访问）\n'
-  read -r -p '请选择 [1-2，直接回车取消]：' selected
-  case "$selected" in
-    1) bind_address=127.0.0.1 ;;
-    2) bind_address=0.0.0.0 ;;
-    '') return 0 ;;
-    *) error '无效选项。'; return 1 ;;
+set_web_ui_bind_address() {
+  local bind_address="$1" enabled
+  case "$bind_address" in
+    127.0.0.1|0.0.0.0) ;;
+    *) error 'Web UI 发布地址仅支持 127.0.0.1 或 0.0.0.0。'; return 2 ;;
   esac
+  ensure_config
+  if [[ "$(config_value WEB_UI_BIND_ADDRESS)" == "$bind_address" ]]; then
+    info "Web UI 发布范围已是 ${bind_address}，无需修改。"
+    return 0
+  fi
 
   enabled="$(web_ui_enabled && printf true || printf false)"
   write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$(config_value KOPIA_REPOSITORY_PASSWORD)" "$bind_address"
@@ -797,6 +796,23 @@ configure_web_ui_publish_scope() {
       ;;
   esac
   success "Web UI 发布范围已改为 ${bind_address}。"
+}
+
+configure_web_ui_publish_scope() {
+  local selected bind_address
+  ensure_config
+  printf '\nWeb UI 发布范围（当前：%s）\n' "$(web_ui_bind_address)"
+  printf '  1. 仅宿主机：127.0.0.1（推荐与反向代理或共享 Docker 网络配合）\n'
+  printf '  2. 所有 IPv4 接口：0.0.0.0（可直接从公网访问）\n'
+  read -r -p '请选择 [1-2，直接回车取消]：' selected
+  case "$selected" in
+    1) bind_address=127.0.0.1 ;;
+    2) bind_address=0.0.0.0 ;;
+    '') return 0 ;;
+    *) error '无效选项。'; return 1 ;;
+  esac
+
+  set_web_ui_bind_address "$bind_address" || return 1
   if [[ "$(current_mode)" == docker && "$bind_address" == 127.0.0.1 ]]; then
     info 'NPM 可继续通过共享 Docker 网络访问 kopia-web-ui:51515；不要在 NPM 中填写 127.0.0.1。'
   fi
@@ -1125,6 +1141,11 @@ main_menu() {
 
 if [[ $# -eq 1 && ( "$1" == --help || "$1" == -h ) ]]; then show_command_usage; exit 0; fi
 if [[ $# -eq 1 && "$1" == --install-manager ]]; then require_root "$@"; install_manager_command; success 'KopiaCtl 管理菜单已安装。'; main_menu; exit 0; fi
+if [[ $# -eq 3 && "$1" == web-ui && "$2" == set-bind ]]; then
+  require_root "$@"
+  set_web_ui_bind_address "$3"
+  exit $?
+fi
 [[ $# -eq 0 ]] || { show_command_usage; exit 2; }
 require_root "$@"
 main_menu
