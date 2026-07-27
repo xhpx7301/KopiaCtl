@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.23"
+readonly MANAGER_VERSION="1.0.25"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -556,13 +556,22 @@ set -euo pipefail
 
 config_file="$1"
 binary="$2"
-bind_address="$3"
-port="$4"
-username="$5"
-web_password="$6"
-repository_config="$7"
+bind_address="$(sed -n 's/^WEB_UI_BIND_ADDRESS=//p' "$config_file" | tail -n 1)"
+if [[ "${3:-}" =~ ^[1-9][0-9]*$ ]]; then
+  port="$3"
+  username="$4"
+  web_password="$5"
+  repository_config="$6"
+else
+  # Accept the pre-1.0.25 systemd argument layout during an in-place upgrade.
+  port="$4"
+  username="$5"
+  web_password="$6"
+  repository_config="$7"
+fi
 repository_password_b64="$(sed -n 's/^KOPIA_REPOSITORY_PASSWORD_B64=//p' "$config_file" | tail -n 1)"
 
+[[ -n "$bind_address" ]] || { printf 'Web UI bind address is not configured.\n' >&2; exit 63; }
 [[ -n "$repository_password_b64" ]] || {
   printf 'Kopia repository password is not configured for the Web UI service.\n' >&2
   exit 64
@@ -584,7 +593,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=KOPIA_CONFIG_PATH=${KOPIA_CONFIG_FILE}
-ExecStart=${MANAGER_DIR}/kopia-web-ui-service.sh ${CONFIG_FILE} ${binary} ${bind_address} ${port} ${service_user} ${service_password} ${KOPIA_CONFIG_FILE}
+ExecStart=${MANAGER_DIR}/kopia-web-ui-service.sh ${CONFIG_FILE} ${binary} ${port} ${service_user} ${service_password} ${KOPIA_CONFIG_FILE}
 Restart=on-failure
 RestartSec=5
 
@@ -937,13 +946,18 @@ modify_web_ui_credentials() {
   fi
 }
 
+native_web_ui_listening_addresses() {
+  local port="$(web_ui_port)"
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -ltnH 2>/dev/null | awk -v port="$port" '$4 ~ (":" port "$") { print $4 }'
+}
+
 native_web_ui_port_listening_on() {
   local bind_address="$1" port="$(web_ui_port)"
-  command -v ss >/dev/null 2>&1 || return 1
   if [[ "$bind_address" == 0.0.0.0 ]]; then
-    ss -ltnH "sport = :${port}" 2>/dev/null | grep -Eq "(^|[[:space:]])(0\.0\.0\.0|\*):${port}([[:space:]]|$)"
+    native_web_ui_listening_addresses | grep -Exq "(0\.0\.0\.0|\*):${port}"
   else
-    ss -ltnH "sport = :${port}" 2>/dev/null | grep -Fq -- "${bind_address}:${port}"
+    native_web_ui_listening_addresses | grep -Fxq "${bind_address}:${port}"
   fi
 }
 
@@ -969,6 +983,21 @@ wait_for_web_ui_bind_address() {
   return 1
 }
 
+remove_caddyctl_native_listener_override() {
+  local override_dir="/etc/systemd/system/kopia-web-ui.service.d"
+  local override_path="${override_dir}/caddyctl-listener.conf"
+
+  [[ -f "$override_path" ]] || return 0
+  if ! grep -Fq '/caddyctl/service-wrappers/' "$override_path"; then
+    error "发现非 KopiaCtl 管理的 systemd 覆盖文件：${override_path}。请先检查后再修改发布范围。"
+    return 1
+  fi
+  warn '检测到 CaddyCtl 曾接管 Kopia Web UI 监听地址；将移除其覆盖并由 KopiaCtl 接管。'
+  rm -f -- "$override_path" || return 1
+  rmdir "$override_dir" 2>/dev/null || true
+  systemctl daemon-reload
+}
+
 set_web_ui_bind_address() {
   local bind_address="$1" enabled configured_address
   is_web_ui_bind_address "$bind_address" || { error 'Web UI 发布地址必须是 127.0.0.1、0.0.0.0 或本机 IPv4 地址。'; return 2; }
@@ -985,6 +1014,10 @@ set_web_ui_bind_address() {
   fi
   if [[ "$configured_address" == "$bind_address" && "$enabled" == true ]]; then
     warn "配置为 ${bind_address}，但实际监听或端口映射不一致；将重新应用并验证。"
+  fi
+
+  if [[ "$(current_mode)" == native ]]; then
+    remove_caddyctl_native_listener_override || return 1
   fi
 
   write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$(config_value KOPIA_REPOSITORY_PASSWORD)" "$bind_address"
@@ -1047,7 +1080,7 @@ configure_web_ui_publish_scope() {
 
 show_web_ui_status() {
   local state restarting restart_count exit_code oom_killed finished_at state_error
-  local container_address host_bindings browser_port
+  local container_address host_bindings browser_port actual_addresses
   case "$(current_mode)" in
     native)
       state="$(systemctl is-active kopia-web-ui.service 2>/dev/null || true)"
@@ -1063,6 +1096,8 @@ show_web_ui_status() {
         fi
       else
         error "未检测到端口监听：$(web_ui_bind_address):$(web_ui_port)"
+        actual_addresses="$(native_web_ui_listening_addresses | paste -sd ',' -)"
+        [[ -z "$actual_addresses" ]] || warn "同端口当前实际监听：${actual_addresses}"
       fi
       if [[ "$state" != active ]] || ! native_web_ui_port_listening; then
         error 'Web UI 尚不可访问。请检查下方日志中的仓库配置、仓库密码、端口或网络错误。'
