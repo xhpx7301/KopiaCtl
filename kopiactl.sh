@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.27"
+readonly MANAGER_VERSION="1.0.28"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -903,6 +903,38 @@ select_managed_backup_schedule() {
   load_schedule_file "${SCHEDULE_FILES[$((choice - 1))]}"
 }
 
+modify_managed_backup_schedule() {
+  local path mode mode_label current_kind current_value kind_choice kind value
+  printf '\n请选择要修改计划的自动备份：\n'
+  select_managed_backup_schedule || return 0
+  path="$SCHEDULE_PATH"
+  mode="$SCHEDULE_MODE"
+  current_kind="$SCHEDULE_KIND"
+  current_value="$SCHEDULE_VALUE"
+  case "$mode" in policy) mode_label='Kopia 策略（Web UI）' ;; timer) mode_label='独立 systemd 定时器' ;; esac
+  case "$current_kind" in interval) current_kind="每 ${current_value}" ;; daily) current_kind="每日 ${current_value}" ;; esac
+  printf '\n当前：%s | %s | %s\n' "$path" "$mode_label" "$current_kind"
+  printf '本操作保持当前模式不变，只修改执行计划。\n'
+  printf '  1. 按间隔执行（例如每 6 小时）\n'
+  printf '  2. 每日固定时间执行\n'
+  read -r -p '请选择新计划 [1-2]：' kind_choice
+  case "$kind_choice" in
+    1)
+      kind=interval
+      read -r -p '新间隔（正整数加 m 或 h，例如 30m、6h）：' value
+      is_valid_schedule_interval "$value" || { error '间隔仅支持正整数加 m 或 h，例如 30m、6h。'; return 1; }
+      ;;
+    2)
+      kind=daily
+      read -r -p '新每日执行时间（24 小时制 HH:MM，例如 02:30）：' value
+      is_valid_schedule_time "$value" || { error '每日时间应为 24 小时制 HH:MM，例如 02:30。'; return 1; }
+      ;;
+    *) error '无效选项。'; return 1 ;;
+  esac
+  confirm_action "确认更新 ${path} 的自动备份计划？" || { info '已取消。'; return 0; }
+  apply_backup_schedule "$path" "$mode" "$kind" "$value"
+}
+
 sync_managed_backup_schedules() {
   local file mode_label schedule_label total=0 succeeded=0 failed=0 skipped=0
   local -a schedule_files=()
@@ -1002,17 +1034,19 @@ backup_schedule_menu() {
     printf '\n%s自动备份管理%s\n' "$BOLD" "$RESET"
     printf '  1. 为文件夹设置或切换自动备份模式（更新 KopiaCtl 与 Kopia Policy 或 systemd timer）\n'
     printf '  2. 查看 KopiaCtl 管理的自动备份（仅查看；不修改 Kopia Policy 或 systemd timer）\n'
-    printf '  3. 导入现有 Kopia Policy（只读 Web UI Policy，写入 KopiaCtl 记录）\n'
-    printf '  4. 修复/重新应用全部已管理策略（以 KopiaCtl 为准覆盖 Kopia Policy 或 systemd timer）\n'
-    printf '  5. 停用文件夹自动备份（删除 KopiaCtl 记录并停用 Kopia Policy 或 systemd timer）\n'
+    printf '  3. 修改已管理自动备份计划（保持模式，只修改执行时间）\n'
+    printf '  4. 导入现有 Kopia Policy（只读 Web UI Policy，写入 KopiaCtl 记录）\n'
+    printf '  5. 修复/重新应用全部已管理策略（以 KopiaCtl 为准覆盖 Kopia Policy 或 systemd timer）\n'
+    printf '  6. 停用文件夹自动备份（删除 KopiaCtl 记录并停用 Kopia Policy 或 systemd timer）\n'
     printf '  0. 返回\n'
-    read -r -p '请选择 [0-5]：' selected
+    read -r -p '请选择 [0-6]：' selected
     case "$selected" in
       1) configure_backup_schedule; pause_menu ;;
       2) list_managed_backup_schedules; pause_menu ;;
-      3) import_kopia_policy_schedules; pause_menu ;;
-      4) sync_managed_backup_schedules; pause_menu ;;
-      5) remove_managed_backup_schedule; pause_menu ;;
+      3) modify_managed_backup_schedule; pause_menu ;;
+      4) import_kopia_policy_schedules; pause_menu ;;
+      5) sync_managed_backup_schedules; pause_menu ;;
+      6) remove_managed_backup_schedule; pause_menu ;;
       0) return 0 ;;
       *) warn '无效选项。' ;;
     esac
