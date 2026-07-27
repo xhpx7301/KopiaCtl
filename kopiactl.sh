@@ -673,10 +673,9 @@ apply_backup_schedule() {
     daily) schedule_args=("--snapshot-time=${value}" --run-missed=true) ;;
   esac
   ensure_repository_password || return 1
-  info '正在更新 Kopia 策略，防止同一文件夹被两个计划重复备份...'
-  run_kopia_authenticated policy set "$path" --manual || return 1
   case "$mode" in
     policy)
+      info '正在更新 Kopia 策略计划...'
       run_kopia_authenticated policy set "$path" "${schedule_args[@]}" || return 1
       disable_timer_schedule "$id"
       write_schedule_file "$path" policy "$kind" "$value" || return 1
@@ -684,6 +683,8 @@ apply_backup_schedule() {
       warn '此模式需要 Kopia Web UI 服务/容器持续运行；关闭浏览器不会影响计划，停止服务或容器会暂停计划。'
       ;;
     timer)
+      info '正在将 Kopia 策略设为手动，防止同一文件夹被两个计划重复备份...'
+      run_kopia_authenticated policy set "$path" --manual || return 1
       save_scheduler_repository_password || return 1
       write_schedule_file "$path" timer "$kind" "$value" || return 1
       write_timer_schedule_units "$id" "$kind" "$value" || return 1
