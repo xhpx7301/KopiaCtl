@@ -4,7 +4,7 @@
 set -uo pipefail
 
 readonly PROJECT_NAME="KopiaCtl"
-readonly MANAGER_VERSION="1.0.26"
+readonly MANAGER_VERSION="1.0.27"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
 readonly INSTALL_DIR="/opt/kopiactl"
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
@@ -538,6 +538,14 @@ is_valid_schedule_time() {
 
 schedule_encode_path() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 && return 0
+  warn '导入 Kopia Policy 需要 jq 来安全读取 Kopia 的 JSON 数据。'
+  require_debian || return 1
+  confirm_action '确认安装 jq？' || { info '已取消导入。'; return 1; }
+  apt-get update && apt-get install -y jq || { error 'jq 安装失败。'; return 1; }
+}
+
 SCHEDULE_PATH=''
 SCHEDULE_MODE=''
 SCHEDULE_KIND=''
@@ -739,8 +747,8 @@ configure_backup_schedule() {
 }
 
 list_managed_backup_schedules() {
-  local file state mode_label schedule_label found=false unit
-  printf '\n%sKopiaCtl 管理的自动备份%s\n' "$BOLD" "$RESET"
+  local file state enabled next_run mode_label schedule_label path_state found=false unit
+  printf '\n%sKopiaCtl 管理的自动备份（仅查看，不修改 Kopia Policy 或 systemd timer）%s\n' "$BOLD" "$RESET"
   for file in "$SCHEDULE_DIR"/*.conf; do
     [[ -e "$file" ]] || continue
     if ! load_schedule_file "$file"; then
@@ -750,15 +758,132 @@ list_managed_backup_schedules() {
     found=true
     case "$SCHEDULE_MODE" in policy) mode_label='Kopia 策略（Web UI）' ;; timer) mode_label='独立 systemd 定时器' ;; esac
     case "$SCHEDULE_KIND" in interval) schedule_label="每 ${SCHEDULE_VALUE}" ;; daily) schedule_label="每日 ${SCHEDULE_VALUE}" ;; esac
+    path_state='路径正常'
+    [[ -e "$SCHEDULE_PATH" ]] || path_state='路径不存在'
     if [[ "$SCHEDULE_MODE" == timer ]]; then
       unit="$(schedule_unit_name "$SCHEDULE_ID")"
       state="$(systemctl is-active "${unit}.timer" 2>/dev/null || true)"
-      printf '  - %s | %s | %s | 定时器：%s\n' "$SCHEDULE_PATH" "$mode_label" "$schedule_label" "$(localize_service_state "$state")"
+      enabled="$(systemctl is-enabled "${unit}.timer" 2>/dev/null || true)"
+      next_run="$(systemctl show "${unit}.timer" --property=NextElapseUSecRealtime --value 2>/dev/null || true)"
+      [[ -n "$enabled" ]] || enabled='未启用'
+      [[ -n "$next_run" && "$next_run" != n/a ]] || next_run='未计划'
+      printf '  - %s | %s | %s | %s | timer：%s、%s、下次：%s\n' \
+        "$SCHEDULE_PATH" "$mode_label" "$schedule_label" "$path_state" "$enabled" "$(localize_service_state "$state")" "$next_run"
     else
-      printf '  - %s | %s | %s\n' "$SCHEDULE_PATH" "$mode_label" "$schedule_label"
+      printf '  - %s | %s | %s | %s\n' "$SCHEDULE_PATH" "$mode_label" "$schedule_label" "$path_state"
     fi
   done
   "$found" || info '没有由 KopiaCtl 管理的自动备份。'
+}
+
+IMPORT_KIND=''
+IMPORT_VALUE=''
+IMPORT_REASON=''
+
+classify_importable_policy() {
+  local policy_json="$1" interval time_count cron_count manual run_missed hour minute
+  IMPORT_KIND=''
+  IMPORT_VALUE=''
+  IMPORT_REASON=''
+  manual="$(jq -r '.scheduling.manual // false' <<<"$policy_json")"
+  interval="$(jq -r '.scheduling.intervalSeconds // 0' <<<"$policy_json")"
+  time_count="$(jq -r '(.scheduling.timeOfDay // []) | length' <<<"$policy_json")"
+  cron_count="$(jq -r '(.scheduling.cron // []) | length' <<<"$policy_json")"
+  run_missed="$(jq -r '.scheduling.runMissed // true' <<<"$policy_json")"
+  if [[ "$manual" == true ]]; then IMPORT_REASON='手动策略'; return 1; fi
+  if (( cron_count > 0 )); then IMPORT_REASON='cron 计划'; return 1; fi
+  if [[ "$run_missed" != true ]]; then IMPORT_REASON='run-missed=false'; return 1; fi
+  [[ "$interval" =~ ^[0-9]+$ ]] || { IMPORT_REASON='无效间隔'; return 1; }
+  if (( interval > 0 && time_count == 0 )); then
+    if (( interval % 3600 == 0 )); then
+      IMPORT_KIND=interval
+      IMPORT_VALUE="$((interval / 3600))h"
+    elif (( interval % 60 == 0 )); then
+      IMPORT_KIND=interval
+      IMPORT_VALUE="$((interval / 60))m"
+    else
+      IMPORT_REASON='非整分钟间隔'
+      return 1
+    fi
+    return 0
+  fi
+  if (( interval == 0 && time_count == 1 )); then
+    hour="$(jq -r '.scheduling.timeOfDay[0].hour // empty' <<<"$policy_json")"
+    minute="$(jq -r '.scheduling.timeOfDay[0].min // empty' <<<"$policy_json")"
+    [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]] || { IMPORT_REASON='无效每日时间'; return 1; }
+    printf -v IMPORT_VALUE '%02d:%02d' "$hour" "$minute"
+    is_valid_schedule_time "$IMPORT_VALUE" || { IMPORT_REASON='无效每日时间'; return 1; }
+    IMPORT_KIND=daily
+    return 0
+  fi
+  if (( interval > 0 || time_count > 0 )); then
+    IMPORT_REASON='多种或多个调度时间'
+  else
+    IMPORT_REASON='没有自动备份计划'
+  fi
+  return 1
+}
+
+import_kopia_policy_schedules() {
+  local policy_list_file file record path effective_policy existing_file defined_kind defined_value imported=0 skipped=0 candidates=0
+  local -a import_paths=() import_kinds=() import_values=()
+  ensure_jq || return 1
+  ensure_repository_password || return 1
+  policy_list_file="$(mktemp)" || return 1
+  if ! run_kopia_authenticated policy list --json >"$policy_list_file"; then
+    rm -f "$policy_list_file"
+    error '无法读取 Kopia Policy 列表。'
+    return 1
+  fi
+  printf '\n%s导入 Kopia Policy 预览（不会修改 Web UI 中的策略）%s\n' "$BOLD" "$RESET"
+  while IFS= read -r record; do
+    path="$(jq -r '.target.path // empty' <<<"$record")"
+    [[ "$path" == /* && -e "$path" ]] || { ((skipped++)); continue; }
+    existing_file="$(schedule_file_for_path "$path")"
+    if [[ -f "$existing_file" ]]; then
+      printf '  - %s | 已由 KopiaCtl 管理，跳过\n' "$path"
+      ((skipped++))
+      continue
+    fi
+    if ! classify_importable_policy "$record"; then
+      printf '  - %s | 无法完整导入（%s），跳过\n' "$path" "$IMPORT_REASON"
+      ((skipped++))
+      continue
+    fi
+    defined_kind="$IMPORT_KIND"
+    defined_value="$IMPORT_VALUE"
+    effective_policy="$(run_kopia_authenticated policy show "$path" --json 2>/dev/null)" || {
+      warn "无法读取 ${path} 的实际 Policy，已跳过。"
+      ((skipped++))
+      continue
+    }
+    if ! classify_importable_policy "$effective_policy"; then
+      printf '  - %s | 无法完整导入（%s），跳过\n' "$path" "$IMPORT_REASON"
+      ((skipped++))
+    elif [[ "$IMPORT_KIND" != "$defined_kind" || "$IMPORT_VALUE" != "$defined_value" ]]; then
+      printf '  - %s | 无法完整导入（继承后计划与本地定义不同），跳过\n' "$path"
+      ((skipped++))
+    else
+      ((candidates++))
+      case "$IMPORT_KIND" in interval) printf '  %d. %s | Kopia 策略（Web UI） | 每 %s\n' "$candidates" "$path" "$IMPORT_VALUE" ;; daily) printf '  %d. %s | Kopia 策略（Web UI） | 每日 %s\n' "$candidates" "$path" "$IMPORT_VALUE" ;; esac
+      import_paths+=("$path")
+      import_kinds+=("$IMPORT_KIND")
+      import_values+=("$IMPORT_VALUE")
+    fi
+  done < <(jq -c '.[]' "$policy_list_file")
+  rm -f "$policy_list_file"
+  (( candidates > 0 )) || { info "没有可导入的 Kopia Policy；已跳过 ${skipped} 项。"; return 0; }
+  warn '导入只会创建 KopiaCtl 管理记录；不会修改上述 Kopia Policy。'
+  confirm_action "确认将以上 ${candidates} 个 Kopia Policy 纳入 KopiaCtl 管理？" || { info '已取消导入。'; return 0; }
+  for ((file = 0; file < candidates; file++)); do
+    if write_schedule_file "${import_paths[file]}" policy "${import_kinds[file]}" "${import_values[file]}"; then
+      ((imported++))
+    else
+      error "导入失败：${import_paths[file]}"
+    fi
+  done
+  success "Kopia Policy 导入完成：成功 ${imported} 个，跳过 ${skipped} 个。"
+  (( imported == candidates ))
 }
 
 select_managed_backup_schedule() {
@@ -781,7 +906,7 @@ select_managed_backup_schedule() {
 sync_managed_backup_schedules() {
   local file mode_label schedule_label total=0 succeeded=0 failed=0 skipped=0
   local -a schedule_files=()
-  printf '\n%s自动备份策略同步预览%s\n' "$BOLD" "$RESET"
+  printf '\n%s自动备份策略修复预览（以 KopiaCtl 记录为准）%s\n' "$BOLD" "$RESET"
   for file in "$SCHEDULE_DIR"/*.conf; do
     [[ -e "$file" ]] || continue
     if ! load_schedule_file "$file"; then
@@ -801,11 +926,11 @@ sync_managed_backup_schedules() {
     schedule_files+=("$file")
   done
   (( total > 0 )) || { info '没有可同步的已管理自动备份。'; return 0; }
-  warn '同步会以 KopiaCtl 保存的策略覆盖上述路径当前的 Kopia Policy 或 systemd timer。'
+  warn '重新应用会以 KopiaCtl 保存的策略覆盖上述路径当前的 Kopia Policy 或 systemd timer。'
   if has_managed_timer_schedule; then
     warn '预览中包含独立定时器；同步时会保留或更新无人值守备份所需的受限仓库密码。'
   fi
-  confirm_action "确认同步以上 ${total} 个自动备份策略？" || { info '已取消同步。'; return 0; }
+  confirm_action "确认重新应用以上 ${total} 个自动备份策略？" || { info '已取消。'; return 0; }
   ensure_repository_password || return 1
   for file in "${schedule_files[@]}"; do
     load_schedule_file "$file" || { ((failed++)); continue; }
@@ -817,9 +942,9 @@ sync_managed_backup_schedules() {
     fi
   done
   if (( failed == 0 )); then
-    success "自动备份策略同步完成：成功 ${succeeded} 个，跳过 ${skipped} 个。"
+    success "自动备份策略重新应用完成：成功 ${succeeded} 个，跳过 ${skipped} 个。"
   else
-    warn "自动备份策略同步结束：成功 ${succeeded} 个，失败 ${failed} 个，跳过 ${skipped} 个。"
+    warn "自动备份策略重新应用结束：成功 ${succeeded} 个，失败 ${failed} 个，跳过 ${skipped} 个。"
     return 1
   fi
 }
@@ -875,21 +1000,19 @@ backup_schedule_menu() {
   local selected
   while true; do
     printf '\n%s自动备份管理%s\n' "$BOLD" "$RESET"
-    printf '  1. 为文件夹设置或切换自动备份模式\n'
-    printf '     新建或更新 KopiaCtl 管理记录，并立即设置对应的 Kopia Policy 或 systemd timer。\n'
-    printf '  2. 查看 KopiaCtl 管理的自动备份\n'
-    printf '     仅读取 KopiaCtl 管理记录；不会修改 Kopia Policy 或 systemd timer。\n'
-    printf '  3. 同步全部已管理自动备份策略\n'
-    printf '     以 KopiaCtl 管理记录为准，批量覆盖并重建对应的 Kopia Policy 或 systemd timer。\n'
-    printf '  4. 停用文件夹自动备份\n'
-    printf '     删除 KopiaCtl 管理记录，并停用对应的 Kopia Policy 或 systemd timer。\n'
+    printf '  1. 为文件夹设置或切换自动备份模式（更新 KopiaCtl 与 Kopia Policy 或 systemd timer）\n'
+    printf '  2. 查看 KopiaCtl 管理的自动备份（仅查看；不修改 Kopia Policy 或 systemd timer）\n'
+    printf '  3. 导入现有 Kopia Policy（只读 Web UI Policy，写入 KopiaCtl 记录）\n'
+    printf '  4. 修复/重新应用全部已管理策略（以 KopiaCtl 为准覆盖 Kopia Policy 或 systemd timer）\n'
+    printf '  5. 停用文件夹自动备份（删除 KopiaCtl 记录并停用 Kopia Policy 或 systemd timer）\n'
     printf '  0. 返回\n'
-    read -r -p '请选择 [0-4]：' selected
+    read -r -p '请选择 [0-5]：' selected
     case "$selected" in
       1) configure_backup_schedule; pause_menu ;;
       2) list_managed_backup_schedules; pause_menu ;;
-      3) sync_managed_backup_schedules; pause_menu ;;
-      4) remove_managed_backup_schedule; pause_menu ;;
+      3) import_kopia_policy_schedules; pause_menu ;;
+      4) sync_managed_backup_schedules; pause_menu ;;
+      5) remove_managed_backup_schedule; pause_menu ;;
       0) return 0 ;;
       *) warn '无效选项。' ;;
     esac

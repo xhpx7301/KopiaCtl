@@ -9,7 +9,7 @@
 | 两种部署方式 | 可安装原生 Kopia 或 Docker Kopia。Docker 模式会安装 Docker Engine/Compose 并下载 `kopia/kopia` 镜像；切换时保留同一份仓库配置。 |
 | Cloudflare R2 | 引导连接已有仓库，或在空 R2 Bucket 中创建新仓库。R2 密钥由 Kopia 的仓库配置保存，不写入 KopiaCtl 菜单配置。 |
 | 快照与恢复 | 交互式创建快照、列出快照；恢复前会自动显示可恢复快照列表，再输入要恢复的快照 ID。Docker 模式会临时只读挂载备份路径。 |
-| 自动备份 | 每个文件夹可选择 Kopia 策略模式，或独立 systemd 定时器模式；两者互斥。支持按间隔或每日固定时间执行，并可预览后批量同步全部由 KopiaCtl 管理的计划。 |
+| 自动备份 | 每个文件夹可选择 Kopia 策略模式，或独立 systemd 定时器模式；两者互斥。支持按间隔或每日固定时间执行，可导入 Web UI 已有的兼容 Kopia Policy，并可预览后批量重新应用全部由 KopiaCtl 管理的计划。 |
 | Web UI | 默认关闭；可单独启用、启动、停止、查看或修改登录凭据。原生模式使用 systemd，Docker 模式使用 Compose profile；异常状态会以中文显示退出信息和最近错误日志。 |
 | 日常维护 | 查看状态、仓库状态和日志，备份本地配置；可分别卸载 Kopia、KopiaCtl 或两者。 |
 
@@ -56,7 +56,9 @@ R2 配置时输入 Cloudflare Account ID、Bucket、Access Key ID 和 Secret Acc
 - **Kopia 策略**：使用 `kopia policy set` 写入计划，可在 Web UI 的策略页面查看和修改。计划执行依赖运行中的 Kopia Web UI 服务或容器；关闭浏览器不影响它，但停止 `kopia-web-ui.service` 或 `kopia-web-ui` 容器会暂停它。
 - **独立 systemd 定时器**：使用每个文件夹独立的 `kopiactl-backup-*.timer`，即使 Web UI 服务或容器停止也会运行。它不会显示在 Kopia Web UI 中，并需要在本机受限配置文件保存仓库密码。
 
-计划可以按 `30m`、`6h` 这类间隔执行，也可以每日在固定时间执行。创建手动快照成功后可直接为该路径设置自动备份。菜单的“同步全部已管理自动备份策略”会先列出全部有效路径、模式与时间规则；仅在确认后，才将 KopiaCtl 保存的设置重新应用到对应的 Kopia Policy 或 systemd timer。它会覆盖这些路径当前的实际计划，但不会读取或双向同步用户后来直接在 Web UI 中修改的任意策略；若直接在 Web UI 修改策略，请在 KopiaCtl 中重新设置该路径后再执行同步。
+计划可以按 `30m`、`6h` 这类间隔执行，也可以每日在固定时间执行。创建手动快照成功后可直接为该路径设置自动备份。菜单的“修复/重新应用全部已管理策略”会先列出全部有效路径、模式与时间规则；仅在确认后，才将 KopiaCtl 保存的设置重新应用到对应的 Kopia Policy 或 systemd timer。它会覆盖这些路径当前的 Kopia Policy 或 systemd timer，但不会读取或双向同步用户后来直接在 Web UI 中修改的任意策略；若直接在 Web UI 修改策略，请在 KopiaCtl 中重新设置该路径后再重新应用。
+
+“导入现有 Kopia Policy”用于将 Web UI 中已创建的计划纳入 KopiaCtl 管理。它先预览，再经确认将记录写入 `/opt/kopiactl/schedules/`，不会修改 Web UI 中的 Kopia Policy。仅支持本机存在路径且可完整表达为单个间隔或每天一个固定时间的 Policy；cron、多个每日时间、手动策略、`run-missed=false`、复杂继承策略，以及已经由 KopiaCtl 管理的路径都会跳过。独立 systemd timer 不导入任意外部 unit；KopiaCtl 只管理它自己创建的 `kopiactl-backup-*.timer`。
 
 ## 文件位置
 
