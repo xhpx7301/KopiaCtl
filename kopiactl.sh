@@ -667,6 +667,22 @@ save_scheduler_repository_password() {
   write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$password_entry" "$(web_ui_bind_address)" "$password_b64"
 }
 
+set_kopia_policy_manual() {
+  local path="$1"
+  ensure_repository_password || return 1
+
+  # --manual clears the schedule fields, but Kopia keeps an explicit
+  # run-missed setting. Clear it first so the resulting policy is valid.
+  if ! run_kopia_with_repository_password "$REPOSITORY_PASSWORD" policy set "$path" --run-missed=inherit; then
+    error '无法清理 Kopia 策略计划；请查看上方 Kopia 的具体错误。'
+    return 1
+  fi
+  if ! run_kopia_with_repository_password "$REPOSITORY_PASSWORD" policy set "$path" --manual; then
+    error '无法将 Kopia 策略设为手动；请查看上方 Kopia 的具体错误。'
+    return 1
+  fi
+}
+
 apply_backup_schedule() {
   local path="$1" mode="$2" kind="$3" value="$4" id schedule_args=()
   [[ "$path" == /* && -e "$path" && "$path" != *$'\n'* ]] || { error '备份路径必须是存在的 Linux 绝对路径。'; return 1; }
@@ -692,7 +708,7 @@ apply_backup_schedule() {
       ;;
     timer)
       info '正在将 Kopia 策略设为手动，防止同一文件夹被两个计划重复备份...'
-      run_kopia_authenticated policy set "$path" --manual || return 1
+      set_kopia_policy_manual "$path" || return 1
       save_scheduler_repository_password || return 1
       write_schedule_file "$path" timer "$kind" "$value" || return 1
       write_timer_schedule_units "$id" "$kind" "$value" || return 1
@@ -991,8 +1007,7 @@ remove_managed_backup_schedule() {
   mode="$SCHEDULE_MODE"
   confirm_action "确认停用 ${path} 的自动备份？" || { info '已取消。'; return 0; }
   if [[ "$mode" == policy ]]; then
-    ensure_repository_password || return 1
-    run_kopia_authenticated policy set "$path" --manual || return 1
+    set_kopia_policy_manual "$path" || return 1
   fi
   disable_timer_schedule "$id"
   rm -f "${SCHEDULE_DIR}/${id}.conf"
