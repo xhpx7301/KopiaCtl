@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Bash syntax
+        run: bash -n install.sh kopiactl.sh tests/kopiactl_test.sh
+
+      - name: Run ShellCheck
+        run: shellcheck -S warning install.sh kopiactl.sh tests/kopiactl_test.sh
+
+      - name: Run unit tests
+        run: bash tests/kopiactl_test.sh

@@ -6,18 +6,27 @@ set -uo pipefail
 readonly PROJECT_NAME="KopiaCtl"
 readonly MANAGER_VERSION="1.0.28"
 readonly MANAGER_SOURCE_URL="${KOPIACTL_SOURCE_URL:-https://raw.githubusercontent.com/xhpx7301/KopiaCtl/main/kopiactl.sh}"
-readonly INSTALL_DIR="/opt/kopiactl"
+if [[ "${KOPIACTL_LIB_ONLY:-false}" == true ]]; then
+  INSTALL_DIR="${INSTALL_DIR:-/opt/kopiactl}"
+  BACKUP_DIR="${BACKUP_DIR:-/var/backups/kopiactl}"
+  MANAGER_DIR="${MANAGER_DIR:-/usr/local/lib/kopiactl}"
+  MANAGER_COMMAND="${MANAGER_COMMAND:-/usr/local/bin/kopiactl}"
+  SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+else
+  readonly INSTALL_DIR="/opt/kopiactl"
+  readonly BACKUP_DIR="/var/backups/kopiactl"
+  readonly MANAGER_DIR="/usr/local/lib/kopiactl"
+  readonly MANAGER_COMMAND="/usr/local/bin/kopiactl"
+  readonly SYSTEMD_DIR="/etc/systemd/system"
+fi
 readonly CONFIG_FILE="${INSTALL_DIR}/kopiactl.env"
 readonly KOPIA_CONFIG_FILE="${INSTALL_DIR}/config/repository.config"
 readonly CACHE_DIR="${INSTALL_DIR}/cache"
 readonly COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
-readonly BACKUP_DIR="/var/backups/kopiactl"
 readonly SCHEDULE_DIR="${INSTALL_DIR}/schedules"
 readonly SCHEDULE_UNIT_PREFIX="kopiactl-backup-"
-readonly MANAGER_DIR="/usr/local/lib/kopiactl"
 readonly MANAGER_SCRIPT="${MANAGER_DIR}/kopiactl.sh"
-readonly MANAGER_COMMAND="/usr/local/bin/kopiactl"
-readonly SERVICE_FILE="/etc/systemd/system/kopia-web-ui.service"
+readonly SERVICE_FILE="${SYSTEMD_DIR}/kopia-web-ui.service"
 readonly KOPIA_IMAGE="kopia/kopia:latest"
 readonly DEFAULT_WEB_UI_PORT="51515"
 
@@ -46,8 +55,38 @@ secret_character_count() {
   printf '%d' "${#1}"
 }
 
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+normalize_absolute_path() {
+  local path
+  path="$(trim_whitespace "$1")"
+  while [[ "$path" != / && "$path" == */ ]]; do
+    path="${path%/}"
+  done
+  printf '%s\n' "$path"
+}
+
+validate_docker_mount_path() {
+  local path="$1"
+  if [[ "$path" == *:* ]]; then
+    error 'Docker 模式下路径不能包含冒号（:）。'
+    return 1
+  fi
+  case "$path" in
+    /|/app|/app/config|/app/cache|/app/*)
+      error "Docker 模式下不支持直接挂载 ${path}（会与容器内部运行目录冲突）。"
+      return 1
+      ;;
+  esac
+}
+
 read_secret_with_length() {
-  local label="$1" character='' value='' length
+  local label="$1" character='' esc_next='' value='' length
   # read -n bypasses readline, so disable bracketed paste to avoid counting its control bytes.
   printf '\033[?2004l'
   printf '%s [已输入 0 位]：' "$label"
@@ -56,10 +95,21 @@ read_secret_with_length() {
     case "$character" in
       '') break ;;
       $'\177'|$'\b') [[ -z "$value" ]] || value="${value%?}" ;;
+      $'\033')
+        # Consume terminal escape sequences (such as arrow keys) so they are not recorded as password chars.
+        if IFS= read -r -s -n 1 -t 0.05 esc_next; then
+          if [[ "$esc_next" == '[' || "$esc_next" == 'O' ]]; then
+            while IFS= read -r -s -n 1 -t 0.05 esc_next; do
+              [[ "$esc_next" =~ [A-Za-z~] ]] && break
+            done
+          fi
+        fi
+        continue
+        ;;
       *) value+="$character" ;;
     esac
     length="$(secret_character_count "$value")"
-    printf '\r%s [已输入 %d 位]：' "$label" "$length"
+    printf '\r%s [已输入 %d 位]：\033[K' "$label" "$length"
   done
   printf '\n'
   REPLY="$value"
@@ -169,7 +219,9 @@ write_config() {
   bind_address="${7:-$(web_ui_bind_address)}"
   is_web_ui_bind_address "$bind_address" || bind_address=0.0.0.0
   install -d -m 0750 "$INSTALL_DIR" "$(dirname "$KOPIA_CONFIG_FILE")" "$CACHE_DIR"
-  cat >"$CONFIG_FILE" <<EOF
+  (
+    umask 077
+    cat >"$CONFIG_FILE" <<EOF
 # 由 KopiaCtl 管理。R2 密钥仅保存在 Kopia 的 repository.config 中。
 INSTALL_MODE=${mode}
 WEB_UI_ENABLED=${enabled}
@@ -180,6 +232,7 @@ WEB_UI_BIND_ADDRESS=${bind_address}
 KOPIA_REPOSITORY_PASSWORD=${repository_password_entry}
 KOPIA_REPOSITORY_PASSWORD_B64=${repository_password_b64}
 EOF
+  )
   chmod 0600 "$CONFIG_FILE"
 }
 
@@ -252,7 +305,7 @@ install_native_kopia() {
   apt-get update || return 1
   apt-get install -y ca-certificates curl gnupg || { error '安装前置依赖失败。'; return 1; }
   curl -fsSL --proto '=https' --tlsv1.2 https://kopia.io/signing-key | gpg --dearmor --yes -o /usr/share/keyrings/kopia-keyring.gpg || { error '下载或导入 Kopia 签名密钥失败。'; return 1; }
-  printf '%s\n' 'deb [signed-by=/usr/share/keyrings/kopia-keyring.gpg] http://packages.kopia.io/apt/ stable main' > /etc/apt/sources.list.d/kopia.list
+  printf '%s\n' 'deb [signed-by=/usr/share/keyrings/kopia-keyring.gpg] https://packages.kopia.io/apt/ stable main' > /etc/apt/sources.list.d/kopia.list
   apt-get update && apt-get install -y kopia || { error 'Kopia 安装失败。'; return 1; }
   success "Kopia 已安装：$(kopia --version 2>/dev/null | head -n 1)"
 }
@@ -425,17 +478,28 @@ check_r2_endpoint() {
 }
 
 run_with_progress() {
-  local description="$1" pid elapsed=0 result
+  local description="$1" pid elapsed=0 result=0 prev_int_trap interrupted=false
   shift
+  prev_int_trap="$(trap -p INT || true)"
   "$@" &
   pid=$!
+  trap 'interrupted=true; kill -TERM "$pid" 2>/dev/null || true' INT
   while kill -0 "$pid" 2>/dev/null; do
-    printf '\r%s[处理中]%s %s（已等待 %d 秒，Ctrl+C 可取消）' "$BLUE" "$RESET" "$description" "$elapsed"
-    sleep 1
-    ((elapsed++))
+    printf '\r%s[处理中]%s %s（已等待 %d 秒，Ctrl+C 可取消）\033[K' "$BLUE" "$RESET" "$description" "$elapsed"
+    sleep 1 || true
+    elapsed=$((elapsed + 1))
   done
   wait "$pid"; result=$?
-  printf '\r%*s\r' 100 ''
+  if [[ -n "$prev_int_trap" ]]; then
+    eval "$prev_int_trap"
+  else
+    trap - INT
+  fi
+  printf '\r\033[K'
+  if [[ "$interrupted" == true ]]; then
+    warn '操作已取消。'
+    return 130
+  fi
   return "$result"
 }
 
@@ -451,9 +515,16 @@ configure_r2_repository() {
   read -r -p 'Cloudflare Account ID：' account_id
   read -r -p 'R2 Bucket 名称：' bucket
   read -r -p 'R2 Access Key ID：' access_key
+  account_id="$(trim_whitespace "$account_id")"
+  bucket="$(trim_whitespace "$bucket")"
+  access_key="$(trim_whitespace "$access_key")"
   read_secret_with_length 'R2 Secret Access Key' || return 1
   secret_key="$REPLY"
   [[ -n "$account_id" && -n "$bucket" && -n "$access_key" && -n "$secret_key" ]] || { error 'Account ID、Bucket 与 R2 密钥均不能为空。'; return 1; }
+  if [[ "$account_id" == *".r2.cloudflarestorage.com"* || "$account_id" == *"://"* || "$account_id" == */* || ! "$account_id" =~ ^[A-Za-z0-9-]+$ ]]; then
+    error 'Cloudflare Account ID 格式无效：请只输入 Account ID 本身，不要包含 https:// 或 .r2.cloudflarestorage.com。'
+    return 1
+  fi
   endpoint="${account_id}.r2.cloudflarestorage.com"
   check_r2_endpoint "$endpoint" || return 1
   if [[ "$action" == 2 ]]; then
@@ -487,15 +558,23 @@ configure_r2_repository() {
         ;;
     esac
     success 'Web UI 已连接到新的仓库配置。'
+  elif has_managed_timer_schedule; then
+    info '检测到独立 systemd 自动备份，正在同步更新保存的仓库密码...'
+    save_scheduler_repository_password || return 1
+    success '独立定时备份所需的仓库密码已更新。'
   fi
 }
 
 create_snapshot() {
   local path mode
   read -r -p '请输入要备份的绝对路径：' path
+  path="$(normalize_absolute_path "$path")"
   [[ "$path" == /* && -e "$path" ]] || { error '请输入存在的 Linux 绝对路径。'; return 1; }
-  ensure_repository_password || return 1
   mode="$(current_mode)"
+  if [[ "$mode" == docker ]]; then
+    validate_docker_mount_path "$path" || return 1
+  fi
+  ensure_repository_password || return 1
   if [[ "$mode" == docker ]]; then
     require_docker || return 1
     if ! KOPIA_PASSWORD="$REPOSITORY_PASSWORD" docker run --rm -e KOPIA_PASSWORD \
@@ -508,7 +587,7 @@ create_snapshot() {
       return 1
     fi
   else
-    run_kopia_authenticated snapshot create "$path"
+    run_kopia_authenticated snapshot create "$path" || return 1
   fi
   if confirm_action '快照已创建。是否现在为此文件夹设置自动备份？'; then
     configure_backup_schedule_for_path "$path"
@@ -573,10 +652,13 @@ load_schedule_file() {
 
 write_schedule_file() {
   local path="$1" mode="$2" kind="$3" value="$4" id file
+  path="$(normalize_absolute_path "$path")"
   id="$(schedule_task_id_for_path "$path")"
   file="$(schedule_file_for_path "$path")"
   install -d -m 0700 "$SCHEDULE_DIR" || return 1
-  cat >"$file" <<EOF
+  (
+    umask 077
+    cat >"$file" <<EOF
 # 由 KopiaCtl 管理；请通过“自动备份管理”修改。
 TASK_ID=${id}
 PATH_B64=$(schedule_encode_path "$path")
@@ -584,6 +666,7 @@ MODE=${mode}
 KIND=${kind}
 VALUE=${value}
 EOF
+  )
   chmod 0600 "$file"
 }
 
@@ -592,7 +675,7 @@ disable_timer_schedule() {
   [[ "$id" =~ ^[a-f0-9]{16}$ ]] || return 1
   unit="$(schedule_unit_name "$id")"
   systemctl disable --now "${unit}.timer" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/${unit}.service" "/etc/systemd/system/${unit}.timer"
+  rm -f "${SYSTEMD_DIR}/${unit}.service" "${SYSTEMD_DIR}/${unit}.timer"
   systemctl daemon-reload
 }
 
@@ -616,43 +699,42 @@ has_managed_timer_schedule() {
 }
 
 write_timer_schedule_units() {
-  local id="$1" kind="$2" value="$3" unit timer_value
+  local id="$1" kind="$2" value="$3" unit timer_lines
   [[ "$id" =~ ^[a-f0-9]{16}$ ]] || return 1
   unit="$(schedule_unit_name "$id")"
   case "$kind" in
     interval)
       is_valid_schedule_interval "$value" || return 1
-      timer_value="OnUnitActiveSec=${value}"
+      timer_lines=$'OnActiveSec='"${value}"$'\nOnUnitActiveSec='"${value}"
       ;;
     daily)
       is_valid_schedule_time "$value" || return 1
-      timer_value="OnCalendar=*-*-* ${value}:00"
+      timer_lines=$'OnCalendar=*-*-* '"${value}:00"$'\nPersistent=true'
       ;;
     *) return 1 ;;
   esac
-  cat >"/etc/systemd/system/${unit}.service" <<EOF
+  cat >"${SYSTEMD_DIR}/${unit}.service" <<EOF
 [Unit]
 Description=KopiaCtl scheduled backup ${id}
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=${MANAGER_COMMAND} schedule-run ${id}
 EOF
-  cat >"/etc/systemd/system/${unit}.timer" <<EOF
+  cat >"${SYSTEMD_DIR}/${unit}.timer" <<EOF
 [Unit]
 Description=KopiaCtl backup timer ${id}
 
 [Timer]
-${timer_value}
-Persistent=true
+${timer_lines}
 Unit=${unit}.service
 
 [Install]
 WantedBy=timers.target
 EOF
-  chmod 0644 "/etc/systemd/system/${unit}.service" "/etc/systemd/system/${unit}.timer"
+  chmod 0644 "${SYSTEMD_DIR}/${unit}.service" "${SYSTEMD_DIR}/${unit}.timer"
   systemctl daemon-reload || return 1
   systemctl enable --now "${unit}.timer" || return 1
 }
@@ -661,7 +743,7 @@ save_scheduler_repository_password() {
   local password_entry password_b64 enabled
   [[ -f "$KOPIA_CONFIG_FILE" ]] || { error '尚未配置 Kopia 仓库。'; return 1; }
   ensure_repository_password || return 1
-  password_entry="$(compose_env_single_quote "$REPOSITORY_PASSWORD")"
+  password_entry="$(compose_env_single_quote "$REPOSITORY_PASSWORD")" || return 1
   password_b64="$(printf '%s' "$REPOSITORY_PASSWORD" | base64 | tr -d '\n')"
   enabled="$(web_ui_enabled && printf true || printf false)"
   write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$password_entry" "$(web_ui_bind_address)" "$password_b64"
@@ -673,11 +755,11 @@ set_kopia_policy_manual() {
 
   # --manual clears the schedule fields, but Kopia keeps an explicit
   # run-missed setting. Clear it first so the resulting policy is valid.
-  if ! run_kopia_with_repository_password "$REPOSITORY_PASSWORD" policy set "$path" --run-missed=inherit; then
+  if ! run_kopia_authenticated policy set "$path" --run-missed=inherit; then
     error '无法清理 Kopia 策略计划；请查看上方 Kopia 的具体错误。'
     return 1
   fi
-  if ! run_kopia_with_repository_password "$REPOSITORY_PASSWORD" policy set "$path" --manual; then
+  if ! run_kopia_authenticated policy set "$path" --manual; then
     error '无法将 Kopia 策略设为手动；请查看上方 Kopia 的具体错误。'
     return 1
   fi
@@ -685,7 +767,11 @@ set_kopia_policy_manual() {
 
 apply_backup_schedule() {
   local path="$1" mode="$2" kind="$3" value="$4" id schedule_args=()
+  path="$(normalize_absolute_path "$path")"
   [[ "$path" == /* && -e "$path" && "$path" != *$'\n'* ]] || { error '备份路径必须是存在的 Linux 绝对路径。'; return 1; }
+  if [[ "$mode" == timer && "$(current_mode)" == docker ]]; then
+    validate_docker_mount_path "$path" || return 1
+  fi
   case "$kind" in
     interval) is_valid_schedule_interval "$value" || { error '间隔仅支持正整数加 m 或 h，例如 30m、6h。'; return 1; } ;;
     daily) is_valid_schedule_time "$value" || { error '每日时间应为 24 小时制 HH:MM，例如 02:30。'; return 1; } ;;
@@ -693,8 +779,8 @@ apply_backup_schedule() {
   esac
   id="$(schedule_task_id_for_path "$path")"
   case "$kind" in
-    interval) schedule_args=("--snapshot-interval=${value}" --run-missed=true) ;;
-    daily) schedule_args=("--snapshot-time=${value}" --run-missed=true) ;;
+    interval) schedule_args=(--no-manual "--snapshot-interval=${value}" --snapshot-time=inherit --run-missed=true) ;;
+    daily) schedule_args=(--no-manual --snapshot-interval=inherit "--snapshot-time=${value}" --run-missed=true) ;;
   esac
   ensure_repository_password || return 1
   case "$mode" in
@@ -721,6 +807,7 @@ apply_backup_schedule() {
 
 configure_backup_schedule_for_path() {
   local path="$1" mode_choice kind_choice value mode kind
+  path="$(normalize_absolute_path "$path")"
   [[ "$path" == /* && -e "$path" ]] || { error '备份路径必须是存在的 Linux 绝对路径。'; return 1; }
   printf '\n%s自动备份：%s%s\n' "$BOLD" "$path" "$RESET"
   printf '  1. Kopia 策略（Web UI 可查看和修改；需要 Web UI 服务/容器运行）\n'
@@ -868,7 +955,7 @@ import_kopia_policy_schedules() {
     fi
     defined_kind="$IMPORT_KIND"
     defined_value="$IMPORT_VALUE"
-    effective_policy="$(run_kopia_authenticated policy show "$path" --json 2>/dev/null)" || {
+    effective_policy="$(run_kopia_with_repository_password "$REPOSITORY_PASSWORD" policy show "$path" --json 2>/dev/null)" || {
       warn "无法读取 ${path} 的实际 Policy，已跳过。"
       ((skipped++))
       continue
@@ -1033,6 +1120,7 @@ run_scheduled_backup() {
       KOPIA_PASSWORD="$password" native_kopia snapshot create "$path"
       ;;
     docker)
+      validate_docker_mount_path "$path" || return 1
       require_docker || return 1
       KOPIA_PASSWORD="$password" docker run --rm -e KOPIA_PASSWORD \
         -v "$(dirname "$KOPIA_CONFIG_FILE"):/app/config" \
@@ -1078,11 +1166,15 @@ restore_snapshot() {
   read -r -p '请输入上方列表中的快照 ID [输入0返回]：' snapshot_id
   [[ "$snapshot_id" == 0 ]] && { info '已取消恢复。'; return 0; }
   read -r -p '请输入恢复目标的绝对路径（目录会被创建）：' destination
+  destination="$(normalize_absolute_path "$destination")"
   [[ "$snapshot_id" =~ ^[A-Za-z0-9._:-]+$ && "$destination" == /* ]] || { error '快照 ID 或恢复路径无效。'; return 1; }
-  confirm_action "确认将快照 ${snapshot_id} 恢复到 ${destination}？" || { info '已取消。'; return 0; }
-  install -d -m 0750 "$destination" || return 1
-  ensure_repository_password || return 1
   mode="$(current_mode)"
+  if [[ "$mode" == docker ]]; then
+    validate_docker_mount_path "$destination" || return 1
+  fi
+  confirm_action "确认将快照 ${snapshot_id} 恢复到 ${destination}？" || { info '已取消。'; return 0; }
+  [[ -d "$destination" ]] || install -d -m 0750 "$destination" || return 1
+  ensure_repository_password || return 1
   if [[ "$mode" == docker ]]; then
     require_docker || return 1
     if ! KOPIA_PASSWORD="$REPOSITORY_PASSWORD" docker run --rm -e KOPIA_PASSWORD \
@@ -1100,37 +1192,48 @@ restore_snapshot() {
 }
 
 write_native_service() {
-  local binary password port user bind_address service_password service_user
+  local binary password port user bind_address
   binary="$(command -v kopia)" || { error '未安装原生 Kopia。'; return 1; }
   password="$(config_value WEB_UI_PASSWORD)"
   port="$(web_ui_port)"
   user="$(web_ui_user)"
   bind_address="$(web_ui_bind_address)"
   [[ -n "$password" ]] || { error 'Web UI 密码未设置。'; return 1; }
-  service_password="${password//%/%%}"
-  service_user="${user//%/%%}"
-  cat >"${MANAGER_DIR}/kopia-web-ui-service.sh" <<'EOF'
+  (
+    umask 077
+    cat >"${MANAGER_DIR}/kopia-web-ui-service.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 config_file="$1"
 binary="$2"
-bind_address="$(sed -n 's/^WEB_UI_BIND_ADDRESS=//p' "$config_file" | tail -n 1)"
-if [[ "${3:-}" =~ ^[1-9][0-9]*$ ]]; then
-  port="$3"
-  username="$4"
-  web_password="$5"
+config_val() { sed -n "s/^$1=//p" "$config_file" | tail -n 1; }
+bind_address="$(config_val WEB_UI_BIND_ADDRESS)"
+port="$(config_val WEB_UI_PORT)"
+username="$(config_val WEB_UI_USERNAME)"
+web_password="$(config_val WEB_UI_PASSWORD)"
+
+if [[ "${3:-}" == /* ]]; then
+  repository_config="$3"
+elif [[ "${3:-}" =~ ^[1-9][0-9]*$ ]]; then
+  port="${port:-$3}"
+  username="${username:-$4}"
+  web_password="${web_password:-$5}"
   repository_config="$6"
 else
   # Accept the pre-1.0.25 systemd argument layout during an in-place upgrade.
-  port="$4"
-  username="$5"
-  web_password="$6"
+  port="${port:-$4}"
+  username="${username:-$5}"
+  web_password="${web_password:-$6}"
   repository_config="$7"
 fi
-repository_password_b64="$(sed -n 's/^KOPIA_REPOSITORY_PASSWORD_B64=//p' "$config_file" | tail -n 1)"
+repository_password_b64="$(config_val KOPIA_REPOSITORY_PASSWORD_B64)"
 
 [[ -n "$bind_address" ]] || { printf 'Web UI bind address is not configured.\n' >&2; exit 63; }
+[[ -n "$port" && -n "$username" && -n "$web_password" ]] || {
+  printf 'Web UI credentials or port are not configured.\n' >&2
+  exit 66
+}
 [[ -n "$repository_password_b64" ]] || {
   printf 'Kopia repository password is not configured for the Web UI service.\n' >&2
   exit 64
@@ -1142,8 +1245,11 @@ KOPIA_PASSWORD="$(printf '%s' "$repository_password_b64" | base64 -d)" || {
 export KOPIA_PASSWORD
 exec "$binary" server start --insecure --address="${bind_address}:${port}" --server-username="$username" --server-password="$web_password" --config-file="$repository_config"
 EOF
+  )
   chmod 0700 "${MANAGER_DIR}/kopia-web-ui-service.sh"
-  cat >"$SERVICE_FILE" <<EOF
+  (
+    umask 077
+    cat >"$SERVICE_FILE" <<EOF
 [Unit]
 Description=Kopia Web UI Server
 After=network-online.target
@@ -1152,13 +1258,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=KOPIA_CONFIG_PATH=${KOPIA_CONFIG_FILE}
-ExecStart=${MANAGER_DIR}/kopia-web-ui-service.sh ${CONFIG_FILE} ${binary} ${port} ${service_user} ${service_password} ${KOPIA_CONFIG_FILE}
+ExecStart=${MANAGER_DIR}/kopia-web-ui-service.sh ${CONFIG_FILE} ${binary} ${KOPIA_CONFIG_FILE}
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  )
   chmod 0600 "$SERVICE_FILE"
   systemctl daemon-reload
 }
@@ -1166,10 +1273,20 @@ EOF
 valid_web_ui_value() { [[ "$1" =~ ^[A-Za-z0-9@%+=_,.!:-]+$ ]]; }
 
 compose_env_single_quote() {
-  local value="$1" single_quote="'"
+  local value="$1"
+  if [[ "$value" == *$'\n'* ]]; then
+    error '密码不能包含换行符。'
+    return 1
+  fi
+  if [[ "$value" != *"'"* ]]; then
+    printf "'%s'" "$value"
+    return 0
+  fi
+  # compose-go dotenv treats backslashes inside single quotes literally; use double quotes when "'" is present.
   value="${value//\\/\\\\}"
-  value="${value//"$single_quote"/\\$single_quote}"
-  printf "'%s'" "$value"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  printf '"%s"' "$value"
 }
 
 docker_web_ui_repository_password_configured() {
@@ -1184,7 +1301,7 @@ save_web_ui_repository_password() {
   local password_entry password_b64 enabled
   [[ -f "$KOPIA_CONFIG_FILE" ]] || { error '尚未配置 Kopia 仓库。请先配置 Cloudflare R2 仓库。'; return 1; }
   ensure_repository_password || return 1
-  password_entry="$(compose_env_single_quote "$REPOSITORY_PASSWORD")"
+  password_entry="$(compose_env_single_quote "$REPOSITORY_PASSWORD")" || return 1
   password_b64="$(printf '%s' "$REPOSITORY_PASSWORD" | base64 | tr -d '\n')"
   enabled="$(web_ui_enabled && printf true || printf false)"
   write_config "$(current_mode)" "$enabled" "$(web_ui_user)" "$(config_value WEB_UI_PASSWORD)" "$(web_ui_port)" "$password_entry" "$(web_ui_bind_address)" "$password_b64"
@@ -1393,6 +1510,11 @@ start_web_ui() {
         save_web_ui_repository_password || return 1
       fi
       (cd "$INSTALL_DIR" && docker compose --env-file "$CONFIG_FILE" --profile web up -d) || { error 'Web UI 容器启动失败。'; return 1; }
+      if ! wait_for_web_ui_bind_address "$bind_address" || [[ "$(docker inspect --format '{{.State.Status}}' kopia-web-ui 2>/dev/null || true)" != running ]]; then
+        error 'Web UI 容器未能保持运行并发布端口。以下为状态和最近日志：'
+        show_web_ui_status
+        return 1
+      fi
       ;;
   esac
   if [[ "$bind_address" == 127.0.0.1 ]]; then
@@ -1551,7 +1673,7 @@ wait_for_web_ui_bind_address() {
 }
 
 remove_caddyctl_native_listener_override() {
-  local override_dir="/etc/systemd/system/kopia-web-ui.service.d"
+  local override_dir="${SYSTEMD_DIR}/kopia-web-ui.service.d"
   local override_path="${override_dir}/caddyctl-listener.conf"
 
   [[ -f "$override_path" ]] || return 0
@@ -1638,7 +1760,7 @@ configure_web_ui_publish_scope() {
   esac
 
   set_web_ui_bind_address "$bind_address" || return 1
-  if [[ "$selected" == 2 && web_ui_enabled ]]; then
+  if [[ "$selected" == 2 ]] && web_ui_enabled; then
     verify_npm_gateway_connection || true
   elif [[ "$(current_mode)" == docker && "$bind_address" == 127.0.0.1 ]]; then
     info 'NPM 可继续通过共享 Docker 网络访问 kopia-web-ui:51515；不要在 NPM 中填写 127.0.0.1。'
@@ -1687,10 +1809,18 @@ show_web_ui_status() {
       if [[ -n "$host_bindings" ]]; then
         printf '宿主机端口映射：\n%s\n' "$host_bindings"
         browser_port="$(printf '%s\n' "$host_bindings" | sed -n '1{s/.*://; s/ ->.*//; p;}')"
-        printf '浏览器访问：http://服务器IP:%s\n' "${browser_port:-$(web_ui_port)}"
-        if [[ "$host_bindings" != *'0.0.0.0:'* && "$host_bindings" != *':::'* ]]; then
-          warn '端口仅绑定到指定宿主机地址；远程浏览器无法访问时，请检查端口映射和防火墙。'
-        fi
+        browser_port="${browser_port:-$(web_ui_port)}"
+        case "$(web_ui_bind_address)" in
+          127.0.0.1)
+            printf '本机访问：http://127.0.0.1:%s（远程访问请使用反向代理或共享 Docker 网络）\n' "$browser_port"
+            ;;
+          0.0.0.0)
+            printf '浏览器访问：http://服务器IP:%s\n' "$browser_port"
+            ;;
+          *)
+            printf 'Docker NPM 上游：http://%s:%s（在 NPM 中填写此地址）\n' "$(web_ui_bind_address)" "$browser_port"
+            ;;
+        esac
       else
         error '错误点：未检测到宿主机端口映射，外部浏览器无法访问容器 Web UI。'
       fi
@@ -1726,11 +1856,13 @@ show_logs() {
 }
 
 show_status() {
+  probe_docker_daemon_cache
   printf '\n%sKopia 状态%s\n' "$BOLD" "$RESET"
   printf 'Kopia：%s\nDocker：%s\nWeb UI：%s\n' \
     "$(kopia_runtime_status)" "$(docker_runtime_status)" "$(web_ui_runtime_status)"
   printf '仓库：%s\n配置方式：%s\n配置目录：%s\n' \
     "$(repository_config_status)" "${BLUE}$(localize_mode "$(current_mode)")${RESET}" "$INSTALL_DIR"
+  DOCKER_DAEMON_STATUS_CACHE=''
 }
 
 show_repository_status() { run_kopia_authenticated repository status; }
@@ -1741,13 +1873,16 @@ backup_local_config() {
   install -d -m 0750 "$BACKUP_DIR"
   archive="${BACKUP_DIR}/kopiactl-config.$(timestamp).tar.gz"
   confirm_action "确认创建本地 Kopia 配置备份 ${archive}？" || { info '已取消。'; return 0; }
-  for item in config cache schedules kopiactl.env compose.yml; do
+  for item in config schedules kopiactl.env compose.yml; do
     [[ -e "${INSTALL_DIR}/${item}" ]] && backup_items+=("$item")
   done
   (( ${#backup_items[@]} > 0 )) || { error '没有可备份的本地 Kopia 配置。'; return 1; }
-  tar -C "$INSTALL_DIR" -czf "$archive" "${backup_items[@]}" || { rm -f "$archive"; error '本地配置备份失败。'; return 1; }
+  (
+    umask 077
+    tar -C "$INSTALL_DIR" -czf "$archive" "${backup_items[@]}"
+  ) || { rm -f "$archive"; error '本地配置备份失败。'; return 1; }
   chmod 0600 "$archive"
-  success "本地配置备份完成：${archive}"
+  success "本地配置备份完成（已跳过可重建的 cache）：${archive}"
 }
 
 remove_kopia_runtime() {
@@ -1758,7 +1893,8 @@ remove_kopia_runtime() {
         return 0
       fi
       stop_web_ui
-      rm -f "$SERVICE_FILE"
+      rm -f "$SERVICE_FILE" "${MANAGER_DIR}/kopia-web-ui-service.sh" "${SYSTEMD_DIR}/kopia-web-ui.service.d/caddyctl-listener.conf"
+      rmdir "${SYSTEMD_DIR}/kopia-web-ui.service.d" 2>/dev/null || true
       systemctl daemon-reload
       if command -v dpkg-query >/dev/null 2>&1 \
           && [[ "$(dpkg-query -W -f='${db:Status-Status}' kopia 2>/dev/null || true)" == installed ]]; then
@@ -1810,7 +1946,15 @@ uninstall_everything() {
   confirm_action '确认完全卸载 Kopia 和 KopiaCtl？此操作不可恢复。' || { info '已取消。'; return 0; }
   disable_all_managed_timer_schedules
   remove_kopia_runtime || return 1
-  rm -f /etc/apt/sources.list.d/kopia.list /usr/share/keyrings/kopia-keyring.gpg "$SERVICE_FILE"
+  # Clean up artifacts that may remain from a previously used mode.
+  systemctl disable --now kopia-web-ui.service 2>/dev/null || true
+  if command -v docker >/dev/null 2>&1; then
+    docker rm -f kopia-web-ui 2>/dev/null || true
+    docker image rm "$KOPIA_IMAGE" 2>/dev/null || true
+  fi
+  rm -f /etc/apt/sources.list.d/kopia.list /usr/share/keyrings/kopia-keyring.gpg "$SERVICE_FILE" \
+    "${MANAGER_DIR}/kopia-web-ui-service.sh" "${SYSTEMD_DIR}/kopia-web-ui.service.d/caddyctl-listener.conf"
+  rmdir "${SYSTEMD_DIR}/kopia-web-ui.service.d" 2>/dev/null || true
   systemctl daemon-reload
   remove_manager_files
   rm -rf -- "$INSTALL_DIR" "$BACKUP_DIR"
@@ -1835,26 +1979,52 @@ uninstall_menu() {
   esac
 }
 
-docker_runtime_status() {
+DOCKER_DAEMON_STATUS_CACHE=''
+
+probe_docker_daemon_cache() {
   if ! command -v docker >/dev/null 2>&1; then
-    printf '%sDocker 未安装%s' "$RED" "$RESET"
+    DOCKER_DAEMON_STATUS_CACHE=missing
   elif docker info >/dev/null 2>&1; then
-    printf '%sDocker 已就绪%s' "$GREEN" "$RESET"
+    DOCKER_DAEMON_STATUS_CACHE=available
   else
-    printf '%sDocker 服务不可用%s' "$RED" "$RESET"
+    DOCKER_DAEMON_STATUS_CACHE=unavailable
   fi
 }
 
-docker_kopia_image_status() {
-  if ! command -v docker >/dev/null 2>&1; then
-    printf '%s未安装（Docker 未安装）%s' "$RED" "$RESET"
-  elif ! docker info >/dev/null 2>&1; then
-    printf '%s未安装（Docker 服务不可用）%s' "$RED" "$RESET"
-  elif docker image inspect "$KOPIA_IMAGE" >/dev/null 2>&1; then
-    printf '%sDocker 镜像已安装%s' "$GREEN" "$RESET"
-  else
-    printf '%sDocker 已就绪，镜像未下载%s' "$YELLOW" "$RESET"
+docker_daemon_state() {
+  if [[ -n "$DOCKER_DAEMON_STATUS_CACHE" ]]; then
+    printf '%s' "$DOCKER_DAEMON_STATUS_CACHE"
+    return
   fi
+  if ! command -v docker >/dev/null 2>&1; then
+    printf 'missing'
+  elif docker info >/dev/null 2>&1; then
+    printf 'available'
+  else
+    printf 'unavailable'
+  fi
+}
+
+docker_runtime_status() {
+  case "$(docker_daemon_state)" in
+    available) printf '%sDocker 已就绪%s' "$GREEN" "$RESET" ;;
+    unavailable) printf '%sDocker 服务不可用%s' "$RED" "$RESET" ;;
+    *) printf '%sDocker 未安装%s' "$RED" "$RESET" ;;
+  esac
+}
+
+docker_kopia_image_status() {
+  case "$(docker_daemon_state)" in
+    missing) printf '%s未安装（Docker 未安装）%s' "$RED" "$RESET" ;;
+    unavailable) printf '%s未安装（Docker 服务不可用）%s' "$RED" "$RESET" ;;
+    available)
+      if docker image inspect "$KOPIA_IMAGE" >/dev/null 2>&1; then
+        printf '%sDocker 镜像已安装%s' "$GREEN" "$RESET"
+      else
+        printf '%sDocker 已就绪，镜像未下载%s' "$YELLOW" "$RESET"
+      fi
+      ;;
+  esac
 }
 
 kopia_runtime_status() {
@@ -1916,11 +2086,13 @@ repository_config_status() {
 }
 
 status_line() {
+  probe_docker_daemon_cache
   printf 'Kopia：%s | Web UI：%s\n' "$(kopia_runtime_status)" "$(web_ui_runtime_status)"
   printf 'Docker：%s | 配置方式：%s\n' \
     "$(docker_runtime_status)" "${BLUE}$(localize_mode "$(current_mode)")${RESET}"
   printf '仓库：%s\n' "$(repository_config_status)"
   printf 'KopiaCtl 版本：%s\n' "$MANAGER_VERSION"
+  DOCKER_DAEMON_STATUS_CACHE=''
 }
 
 draw_menu() {
@@ -1988,18 +2160,20 @@ main_menu() {
   done
 }
 
-if [[ $# -eq 1 && ( "$1" == --help || "$1" == -h ) ]]; then show_command_usage; exit 0; fi
-if [[ $# -eq 1 && "$1" == --install-manager ]]; then require_root "$@"; install_manager_command; success 'KopiaCtl 管理菜单已安装。'; main_menu; exit 0; fi
-if [[ $# -eq 3 && "$1" == web-ui && "$2" == set-bind ]]; then
+if [[ "${KOPIACTL_LIB_ONLY:-false}" != true ]]; then
+  if [[ $# -eq 1 && ( "$1" == --help || "$1" == -h ) ]]; then show_command_usage; exit 0; fi
+  if [[ $# -eq 1 && "$1" == --install-manager ]]; then require_root "$@"; install_manager_command; success 'KopiaCtl 管理菜单已安装。'; main_menu; exit 0; fi
+  if [[ $# -eq 3 && "$1" == web-ui && "$2" == set-bind ]]; then
+    require_root "$@"
+    set_web_ui_bind_address "$3"
+    exit $?
+  fi
+  if [[ $# -eq 2 && "$1" == schedule-run ]]; then
+    require_root "$@"
+    run_scheduled_backup "$2"
+    exit $?
+  fi
+  [[ $# -eq 0 ]] || { show_command_usage; exit 2; }
   require_root "$@"
-  set_web_ui_bind_address "$3"
-  exit $?
+  main_menu
 fi
-if [[ $# -eq 2 && "$1" == schedule-run ]]; then
-  require_root "$@"
-  run_scheduled_backup "$2"
-  exit $?
-fi
-[[ $# -eq 0 ]] || { show_command_usage; exit 2; }
-require_root "$@"
-main_menu
